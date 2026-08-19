@@ -69,3 +69,67 @@ _Avoid_: Generated URDF, copied URDF
 **Structural subtree selection**:
 A robot model view that retains an existing link and its descendants without reversing joints or changing their transforms.
 _Avoid_: Rerooting, kinematic rerooting
+
+# DimOS Memory
+
+DimOS Memory turns typed robot streams into durable observations that can be queried and replayed across processes and languages.
+
+## Language
+
+**Observation**:
+A payload at a source time, optionally enriched with pose, tags, and embeddings.
+_Avoid_: Record, row, sample
+
+**Recording Store**:
+A durable sink that turns ordered incoming stream messages into a recording artifact.
+_Avoid_: Recorder backend, database writer
+
+**Recording Artifact**:
+A self-contained persisted dataset produced by a recording store and later opened as a memory store.
+_Avoid_: Database when referring to multiple artifact formats
+
+**Source Time**:
+The time assigned by the message producer and used as the observation's replay time.
+_Avoid_: Publish time outside MCAP-specific discussions
+
+**Reception Time**:
+The time at which the recorder receives a message, retained separately from source time.
+_Avoid_: Arrival timestamp
+
+**Wire Payload**:
+The exact serialized message bytes delivered by a transport.
+_Avoid_: Raw data
+
+**Storage Codec**:
+A transformation that controls how a payload is represented inside a recording artifact; it is distinct from the transport's wire encoding.
+_Avoid_: Compression when the transformation also changes representation
+
+## Recording
+
+**Source observation**:
+An observation whose publisher call completed successfully.
+_Avoid_: Frame, sent message
+
+**Received observation**:
+A source observation emitted by the Recorder's input transport before Recorder scheduling or storage.
+_Avoid_: Recorded observation
+
+**Persisted observation**:
+An observation committed to the recording and readable through its configured codec.
+_Avoid_: Received observation, saved frame
+
+**Recording fidelity**:
+Exact correspondence between source observations and persisted observations, including membership, order, timestamps, and codec-defined payload content.
+_Avoid_: Frame rate, throughput
+
+**Recorder fidelity**:
+Exact correspondence between received observations and persisted observations. Recording fidelity also includes the transport path before the Recorder.
+_Avoid_: Recording fidelity
+
+**Shared loss window**:
+A source-time interval in which every recorded data stream is missing observations.
+_Avoid_: Freeze, lag spike
+
+**Tail loss**:
+Observations lost between the start of graceful shutdown and the recording's final commit.
+_Avoid_: Shared loss window
