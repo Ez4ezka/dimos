@@ -157,7 +157,7 @@ teleop_quest_go2 = (
         {
             ("cmd_vel", Twist): LCMTransport("/cmd_vel", Twist),
             ("color_image", Image): pSHMTransport(
-                "color_image", default_capacity=DEFAULT_CAPACITY_COLOR_IMAGE
+                "color_image", queue_size=1, default_capacity=DEFAULT_CAPACITY_COLOR_IMAGE
             ),
         }
     )
