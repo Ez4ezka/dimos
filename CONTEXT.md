@@ -84,6 +84,18 @@ _Avoid_: Record, row, sample
 A durable sink that turns ordered incoming stream messages into a recording artifact.
 _Avoid_: Recorder backend, database writer
 
+**Recording Engine**:
+A runtime component that subscribes to typed streams and passes their observations to a recording store.
+_Avoid_: Recording Store, Collection Recording Profile
+
+**Collection Recording Profile**:
+The declarative stream selection and recorder defaults for an imitation-learning collection workflow.
+_Avoid_: Recording Engine, data collection logic
+
+**Episode Status Update**:
+A source-timestamped snapshot emitted after an imitation-learning episode transition.
+_Avoid_: Button event, recorder command
+
 **Recording Artifact**:
 A self-contained persisted dataset produced by a recording store and later opened as a memory store.
 _Avoid_: Database when referring to multiple artifact formats
