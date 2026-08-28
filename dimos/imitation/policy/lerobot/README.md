@@ -27,7 +27,7 @@ policy = LeRobotPolicyModule.blueprint(
         )
     },
     joint_names=["arm/joint1", "arm/joint2", "arm/gripper"],
-    fps=15.0,
+    fps=30.0,
     robot_type="my_robot",
 )
 ```

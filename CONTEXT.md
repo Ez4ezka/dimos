@@ -145,3 +145,33 @@ _Avoid_: Freeze, lag spike
 **Tail loss**:
 Observations lost between the start of graceful shutdown and the recording's final commit.
 _Avoid_: Shared loss window
+
+# Robot Learning Data
+
+This context names the observations, commands, episodes, and frames used to turn robot demonstrations into training datasets.
+
+## Language
+
+**Measured Joint State**:
+The positions, velocities, and efforts reported by robot hardware during a control cycle.
+_Avoid_: Action, joint target
+
+**Applied Joint Position Command**:
+A position command that won control arbitration and was accepted by the hardware adapter.
+_Avoid_: Future state, inferred action, requested command
+
+**Saved Episode**:
+A demonstration the operator explicitly chose to keep.
+_Avoid_: Valid episode, successful training sample
+
+**Valid Episode**:
+A saved episode whose required features satisfy the configured schema, timing, and quality contract.
+_Avoid_: Saved episode
+
+**Filled Episode**:
+A valid episode whose missing fixed-rate frames were preserved with explicitly marked causal holds.
+_Avoid_: Interpolated episode, repaired episode
+
+**Training Frame**:
+One fixed-rate set of aligned observations, an applied action, task text, and complementary information.
+_Avoid_: Camera frame, raw sample

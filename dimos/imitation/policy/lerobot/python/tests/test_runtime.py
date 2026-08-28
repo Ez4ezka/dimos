@@ -48,7 +48,7 @@ class FakeUpstreamConfig:
         self.device: str | None = "cpu"
         self.use_amp = False
         self.input_features = {
-            "observation.images.image": FakeFeature((3, 4, 5)),
+            "observation.images.wrist": FakeFeature((3, 4, 5)),
             "observation.state": FakeFeature((joint_count,)),
         }
         self.output_features = {"action": FakeFeature((joint_count,))}
@@ -177,7 +177,7 @@ def make_runtime(mocker: pytest_mock.MockerFixture) -> Iterator[RuntimeFactory]:
         mocker.patch.object(policy_runtime, "register_third_party_plugins")
 
         module = LeRobotPolicyRuntime(
-            _python_native_runtime=True,
+            _isolated_python_runtime=True,
             policies=policy_configs,
             joint_names=JOINTS,
             fps=50.0,
@@ -223,7 +223,7 @@ def test_policy_uses_direct_lerobot_inference_pipeline(make_runtime: RuntimeFact
     assert policy.batch is not None
     assert policy.batch["task"] == "task for pick_up_cube"
     assert policy.batch["robot_type"] == "test_arm"
-    image = policy.batch["observation.images.image"]
+    image = policy.batch["observation.images.wrist"]
     state = policy.batch["observation.state"]
     assert isinstance(image, Tensor)
     assert isinstance(state, Tensor)
@@ -327,7 +327,7 @@ def test_named_policies_load_on_demand_and_are_cached(make_runtime: RuntimeFacto
 
 def test_policy_rejects_incompatible_checkpoint_features(make_runtime: RuntimeFactory) -> None:
     policy = FakePolicy(np.zeros(len(JOINTS), dtype=np.float32))
-    del policy.upstream_config.input_features["observation.images.image"]
+    del policy.upstream_config.input_features["observation.images.wrist"]
     module, output = make_runtime({"invalid": policy})
     _provide_observation(module)
 

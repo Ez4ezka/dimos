@@ -47,7 +47,7 @@ from dimos.utils.logging_config import setup_logger
 
 logger = setup_logger()
 
-_IMAGE_FEATURE = "observation.images.image"
+_IMAGE_FEATURE = "observation.images.wrist"
 _STATE_FEATURE = "observation.state"
 _ACTION_FEATURE = "action"
 
