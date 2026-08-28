@@ -23,6 +23,7 @@ from dimos.robot.manipulators._modeling import base_pose
 from dimos.robot.manipulators.dual_openyam.model import (
     DUAL_OPENYAM_MODEL,
 )
+from dimos.robot.manipulators.openyam.config import OPENYAM_HOME_JOINTS
 
 DUAL_OPENYAM_DOF_PER_ARM = 6
 DUAL_OPENYAM_HARDWARE_ID = "dual_openyam"
@@ -40,7 +41,7 @@ DUAL_OPENYAM_ARM_JOINTS = [
 ]
 DUAL_OPENYAM_GRIPPER_JOINTS = ["left_arm/gripper", "right_arm/gripper"]
 DUAL_OPENYAM_JOINTS = [*DUAL_OPENYAM_ARM_JOINTS, *DUAL_OPENYAM_GRIPPER_JOINTS]
-DUAL_OPENYAM_HOME_PER_ARM = [0.0, 1.047, 1.047, 0.0, 0.0, 0.0]
+DUAL_OPENYAM_HOME_PER_ARM = list(OPENYAM_HOME_JOINTS)
 DUAL_OPENYAM_HOME_JOINTS = [*DUAL_OPENYAM_HOME_PER_ARM, *DUAL_OPENYAM_HOME_PER_ARM]
 DUAL_OPENYAM_URDF_ARM_JOINTS = [
     f"{side}_joint{index}"
