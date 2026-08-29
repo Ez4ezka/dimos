@@ -65,7 +65,7 @@ def openyam_mock_hardware() -> HardwareComponent:
     """Build an OpenYAM component that is unconditionally safe and in-memory."""
     return _openyam_hardware_component(
         "mock_whole_body",
-        {"initial_positions": [0.0] * len(OPENYAM_JOINTS)},
+        {"initial_positions": [*OPENYAM_HOME_JOINTS, 0.0]},
     )
 
 

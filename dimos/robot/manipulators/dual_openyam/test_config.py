@@ -20,7 +20,6 @@ from dimos.robot.manipulators.dual_openyam.config import (
     DUAL_OPENYAM_ARM_JOINTS,
     DUAL_OPENYAM_HOME_JOINTS,
     DUAL_OPENYAM_JOINTS,
-    DUAL_OPENYAM_URDF_ARM_JOINTS,
     dual_openyam_hardware,
     dual_openyam_model_config,
 )
@@ -30,8 +29,7 @@ from dimos.robot.manipulators.openyam.config import OPENYAM_HOME_JOINTS
 def test_dual_openyam_model_has_canonical_groups_mapping_and_reference_posture() -> None:
     config = dual_openyam_model_config()
 
-    assert config.joint_names == DUAL_OPENYAM_URDF_ARM_JOINTS
-    assert config.get_coordinator_joint_names() == DUAL_OPENYAM_ARM_JOINTS
+    assert config.joint_names == DUAL_OPENYAM_ARM_JOINTS
     assert config.home_joints == DUAL_OPENYAM_HOME_JOINTS
     assert config.max_velocity == pytest.approx(2.0)
     assert [(group.name, group.tip_link) for group in config.planning_groups] == [

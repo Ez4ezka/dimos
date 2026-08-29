@@ -27,15 +27,15 @@ from dimos.imitation.policy.lerobot.module import (
 def test_contract_imports_without_runtime_dependencies() -> None:
     assert LeRobotPolicyModule.implementation == "dimos_lerobot.runtime:LeRobotPolicyRuntime"
     assert contract_rpc_names(LeRobotPolicyModule) == {
-        "execute_learned_policy",
-        "policy_status",
-        "stop_learned_policy",
+        "rollout_status",
+        "start_rollout",
+        "stop_rollout",
     }
 
 
 def test_contract_resolves_sibling_runtime_project() -> None:
     module = LeRobotPolicyModule(
-        policies={"smoke": {"policy_path": "unused"}},
+        policy_path="unused",
         joint_names=["joint"],
     )
     try:
@@ -49,17 +49,17 @@ def test_contract_resolves_sibling_runtime_project() -> None:
     [
         (
             {
-                "policies": {"default": {"policy_path": "checkpoint"}},
+                "policy_path": "checkpoint",
                 "joint_names": ["joint1", "joint1"],
             },
             "joint_names must not contain duplicates",
         ),
         (
             {
-                "policies": {" ": {"policy_path": "checkpoint"}},
+                "policy_path": " ",
                 "joint_names": ["joint1"],
             },
-            "policy names must not be empty",
+            "policy_path must not be blank",
         ),
     ],
 )

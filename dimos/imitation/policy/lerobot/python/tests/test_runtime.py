@@ -28,7 +28,6 @@ import pytest_mock
 import torch
 from torch import Tensor
 
-from dimos.imitation.policy.lerobot.module import LeRobotPolicyConfig
 from dimos.msgs.sensor_msgs.Image import Image, ImageFormat
 from dimos.msgs.sensor_msgs.JointState import JointState
 from dimos.protocol.rpc.pubsubrpc import LCMRPC
@@ -100,9 +99,9 @@ class CapturingOutput:
 class RuntimeFactory(Protocol):
     def __call__(
         self,
-        policies: dict[str, FakePolicy],
+        policy: FakePolicy,
         *,
-        devices: dict[str, str] | None = None,
+        device: str | None = None,
     ) -> tuple[LeRobotPolicyRuntime, CapturingOutput]: ...
 
 
@@ -116,28 +115,16 @@ def make_runtime(mocker: pytest_mock.MockerFixture) -> Iterator[RuntimeFactory]:
     built: list[LeRobotPolicyRuntime] = []
 
     def _make(
-        policies: dict[str, FakePolicy],
+        policy: FakePolicy,
         *,
-        devices: dict[str, str] | None = None,
+        device: str | None = None,
     ) -> tuple[LeRobotPolicyRuntime, CapturingOutput]:
-        policy_configs = {
-            name: LeRobotPolicyConfig(
-                policy_path=f"checkpoint/{name}",
-                task=f"task for {name}",
-                device=(devices or {}).get(name),
-            )
-            for name in policies
-        }
-
-        def load_config(path: str) -> FakeUpstreamConfig:
-            policy = policies[path.rsplit("/", maxsplit=1)[-1]]
+        def load_config(_path: str) -> FakeUpstreamConfig:
             policy.config_load_count += 1
             return policy.upstream_config
 
         policy_class = mocker.MagicMock()
-        policy_class.from_pretrained.side_effect = lambda path, *, config: policies[
-            path.rsplit("/", maxsplit=1)[-1]
-        ]
+        policy_class.from_pretrained.return_value = policy
         mocker.patch.object(
             policy_runtime.PreTrainedConfig,
             "from_pretrained",
@@ -147,10 +134,7 @@ def make_runtime(mocker: pytest_mock.MockerFixture) -> Iterator[RuntimeFactory]:
         mocker.patch.object(
             policy_runtime,
             "make_pre_post_processors",
-            side_effect=lambda *, pretrained_path, **_kwargs: (
-                policies[pretrained_path.rsplit("/", maxsplit=1)[-1]].preprocessor,
-                policies[pretrained_path.rsplit("/", maxsplit=1)[-1]].postprocessor,
-            ),
+            return_value=(policy.preprocessor, policy.postprocessor),
         )
 
         def prepare_observation(
@@ -178,7 +162,9 @@ def make_runtime(mocker: pytest_mock.MockerFixture) -> Iterator[RuntimeFactory]:
 
         module = LeRobotPolicyRuntime(
             _isolated_python_runtime=True,
-            policies=policy_configs,
+            policy_path="checkpoint/default",
+            task="pick up the test object",
+            device=device,
             joint_names=JOINTS,
             fps=50.0,
             robot_type="test_arm",
@@ -210,18 +196,18 @@ def _provide_observation(
 def test_policy_uses_direct_lerobot_inference_pipeline(make_runtime: RuntimeFactory) -> None:
     action = np.arange(len(JOINTS), dtype=np.float32) / 20
     policy = FakePolicy(action)
-    module, output = make_runtime({"pick_up_cube": policy})
+    module, output = make_runtime(policy)
     bgr, positions = _provide_observation(module)
 
-    result = module.execute_learned_policy("pick_up_cube", duration=1.0)
+    result = module.start_rollout(duration=1.0)
 
-    assert "started" in result.lower()
+    assert result["active"] is True
     assert output.published.wait(1.0), "policy did not publish a command"
-    assert policy.reset_count == 1
-    assert policy.preprocessor.reset_count == 1
-    assert policy.postprocessor.reset_count == 1
+    assert policy.reset_count >= 1
+    assert policy.preprocessor.reset_count >= 1
+    assert policy.postprocessor.reset_count >= 1
     assert policy.batch is not None
-    assert policy.batch["task"] == "task for pick_up_cube"
+    assert policy.batch["task"] == "pick up the test object"
     assert policy.batch["robot_type"] == "test_arm"
     image = policy.batch["observation.images.wrist"]
     state = policy.batch["observation.state"]
@@ -235,44 +221,45 @@ def test_policy_uses_direct_lerobot_inference_pipeline(make_runtime: RuntimeFact
 
 def test_policy_refuses_to_load_without_live_observations(make_runtime: RuntimeFactory) -> None:
     policy = FakePolicy(np.zeros(len(JOINTS), dtype=np.float32))
-    module, output = make_runtime({"default": policy})
+    module, output = make_runtime(policy)
 
-    result = module.execute_learned_policy("default", duration=1.0)
+    result = module.start_rollout(duration=1.0)
 
-    assert "no camera image" in result
+    assert result["active"] is False
+    assert "no camera image" in (result["last_error"] or "")
     assert policy.config_load_count == 0
     assert output.messages == []
-    assert module.policy_status()["running"] is False
+    assert module.rollout_status()["active"] is False
 
 
 def test_policy_refuses_stale_observations(make_runtime: RuntimeFactory) -> None:
     policy = FakePolicy(np.zeros(len(JOINTS), dtype=np.float32))
-    module, output = make_runtime({"default": policy})
+    module, output = make_runtime(policy)
     stale = time.time() - module.config.max_observation_age_s - 1.0
     module._on_color_image(
         Image(data=np.zeros((4, 5, 3), dtype=np.uint8), format=ImageFormat.RGB, ts=stale)
     )
     module._on_joint_state(JointState(ts=stale, name=JOINTS, position=[0.0] * len(JOINTS)))
 
-    result = module.execute_learned_policy("default", duration=1.0)
+    result = module.start_rollout(duration=1.0)
 
-    assert "camera image is stale" in result
+    assert "camera image is stale" in (result["last_error"] or "")
     assert policy.config_load_count == 0
     assert output.messages == []
 
 
 def test_policy_refuses_incomplete_joint_state(make_runtime: RuntimeFactory) -> None:
     policy = FakePolicy(np.zeros(len(JOINTS), dtype=np.float32))
-    module, output = make_runtime({"default": policy})
+    module, output = make_runtime(policy)
     now = time.time()
     module._on_color_image(
         Image(data=np.zeros((4, 5, 3), dtype=np.uint8), format=ImageFormat.RGB, ts=now)
     )
     module._on_joint_state(JointState(ts=now, name=JOINTS[:-1], position=[0.0] * 3))
 
-    result = module.execute_learned_policy("default", duration=1.0)
+    result = module.start_rollout(duration=1.0)
 
-    assert JOINTS[-1] in result
+    assert JOINTS[-1] in (result["last_error"] or "")
     assert policy.config_load_count == 0
     assert output.messages == []
 
@@ -293,47 +280,44 @@ def test_invalid_policy_action_stops_without_publishing(
     message: str,
 ) -> None:
     policy = FakePolicy(action)
-    module, output = make_runtime({"invalid": policy})
+    module, output = make_runtime(policy)
     _provide_observation(module)
 
-    module.execute_learned_policy("invalid", duration=1.0)
+    module.start_rollout(duration=1.0)
 
     assert policy.called.wait(1.0), "policy was not invoked"
-    wait_until(lambda: module.policy_status()["running"] is False, timeout=1.0)
+    wait_until(lambda: module.rollout_status()["active"] is False, timeout=1.0)
     assert output.messages == []
-    assert message in (module.policy_status()["last_error"] or "")
+    assert message in (module.rollout_status()["last_error"] or "")
 
 
-def test_named_policies_load_on_demand_and_are_cached(make_runtime: RuntimeFactory) -> None:
-    cup = FakePolicy(np.zeros(len(JOINTS), dtype=np.float32))
-    plate = FakePolicy(np.zeros(len(JOINTS), dtype=np.float32))
-    module, _output = make_runtime({"cup": cup, "plate": plate})
+def test_checkpoint_loads_on_demand_and_is_cached(make_runtime: RuntimeFactory) -> None:
+    policy = FakePolicy(np.zeros(len(JOINTS), dtype=np.float32))
+    module, _output = make_runtime(policy)
     _provide_observation(module)
 
-    assert "started" in module.execute_learned_policy("cup", duration=1.0).lower()
-    assert cup.called.wait(1.0)
-    module.stop_learned_policy()
-    assert "started" in module.execute_learned_policy("plate", duration=1.0).lower()
-    assert plate.called.wait(1.0)
-    module.stop_learned_policy()
-    assert "started" in module.execute_learned_policy("cup", duration=1.0).lower()
-    module.stop_learned_policy()
+    assert module.start_rollout(duration=1.0)["active"] is True
+    assert policy.called.wait(1.0)
+    assert module.stop_rollout()["active"] is False
+    policy.called.clear()
+    assert module.start_rollout(duration=1.0)["active"] is True
+    assert policy.called.wait(1.0)
+    module.stop_rollout()
 
-    assert cup.config_load_count == 1
-    assert plate.config_load_count == 1
-    assert cup.reset_count == 2
-    assert module.policy_status()["available_policies"] == ["cup", "plate"]
+    assert policy.config_load_count == 1
+    assert policy.reset_count >= 4
 
 
 def test_policy_rejects_incompatible_checkpoint_features(make_runtime: RuntimeFactory) -> None:
     policy = FakePolicy(np.zeros(len(JOINTS), dtype=np.float32))
     del policy.upstream_config.input_features["observation.images.wrist"]
-    module, output = make_runtime({"invalid": policy})
+    module, output = make_runtime(policy)
     _provide_observation(module)
 
-    result = module.execute_learned_policy("invalid", duration=1.0)
+    module.start_rollout(duration=1.0)
 
-    assert "missing input features" in result
+    wait_until(lambda: module.rollout_status()["active"] is False, timeout=1.0)
+    assert "missing input features" in (module.rollout_status()["last_error"] or "")
     assert output.messages == []
 
 
@@ -342,50 +326,64 @@ def test_policy_rejects_unavailable_cuda_device(
     mocker: pytest_mock.MockerFixture,
 ) -> None:
     policy = FakePolicy(np.zeros(len(JOINTS), dtype=np.float32))
-    module, output = make_runtime({"default": policy}, devices={"default": "cuda"})
+    module, output = make_runtime(policy, device="cuda")
     _provide_observation(module)
     mocker.patch.object(policy_runtime.torch.cuda, "is_available", return_value=False)
 
-    result = module.execute_learned_policy("default", duration=1.0)
+    result = module.start_rollout(duration=1.0)
 
-    assert "CUDA is not available" in result
+    assert result["active"] is True
+    wait_until(lambda: module.rollout_status()["active"] is False, timeout=1.0)
+    assert "CUDA is not available" in (module.rollout_status()["last_error"] or "")
     assert output.messages == []
 
 
 def test_concurrent_policy_start_is_rejected(make_runtime: RuntimeFactory) -> None:
-    cup = FakePolicy(np.zeros(len(JOINTS), dtype=np.float32))
-    plate = FakePolicy(np.zeros(len(JOINTS), dtype=np.float32))
-    module, _output = make_runtime({"cup": cup, "plate": plate})
+    policy = FakePolicy(np.zeros(len(JOINTS), dtype=np.float32))
+    module, _output = make_runtime(policy)
     _provide_observation(module)
-    assert "started" in module.execute_learned_policy("cup", duration=1.0).lower()
-    assert cup.called.wait(1.0)
+    assert module.start_rollout(duration=1.0)["active"] is True
+    assert policy.called.wait(1.0)
 
-    result = module.execute_learned_policy("plate", duration=1.0)
+    result = module.start_rollout(duration=1.0)
 
-    assert "already running" in result.lower()
-    assert plate.config_load_count == 0
-    assert module.stop_learned_policy() == "Learned policy stopped."
+    assert result["active"] is True
+    assert "already active" in (result["last_error"] or "")
+    assert module.stop_rollout()["active"] is False
 
 
 def test_policy_reports_duration_completion(make_runtime: RuntimeFactory) -> None:
     policy = FakePolicy(np.zeros(len(JOINTS), dtype=np.float32))
-    module, output = make_runtime({"default": policy})
+    module, output = make_runtime(policy)
     _provide_observation(module)
 
-    result = module.execute_learned_policy("default", duration=0.05)
+    result = module.start_rollout(duration=0.05)
 
-    assert "started" in result.lower()
+    assert result["active"] is True
     assert output.published.wait(1.0), "policy did not publish before its deadline"
-    wait_until(lambda: module.policy_status()["running"] is False, timeout=1.0)
+    wait_until(lambda: module.rollout_status()["active"] is False, timeout=1.0)
 
 
-def test_unknown_policy_is_rejected_without_loading(make_runtime: RuntimeFactory) -> None:
+def test_rollout_without_duration_runs_until_stopped(make_runtime: RuntimeFactory) -> None:
     policy = FakePolicy(np.zeros(len(JOINTS), dtype=np.float32))
-    module, output = make_runtime({"cup": policy})
+    module, output = make_runtime(policy)
     _provide_observation(module)
 
-    result = module.execute_learned_policy("missing")
+    assert module.start_rollout()["active"] is True
+    assert output.published.wait(1.0)
 
-    assert "unknown learned policy" in result.lower()
+    assert module.rollout_status()["active"] is True
+    assert module.stop_rollout()["active"] is False
+
+
+def test_invalid_duration_is_rejected_without_loading(make_runtime: RuntimeFactory) -> None:
+    policy = FakePolicy(np.zeros(len(JOINTS), dtype=np.float32))
+    module, output = make_runtime(policy)
+    _provide_observation(module)
+
+    result = module.start_rollout(duration=0.0)
+
+    assert result["active"] is False
+    assert result["last_error"] == "duration must be greater than zero"
     assert policy.config_load_count == 0
     assert output.messages == []

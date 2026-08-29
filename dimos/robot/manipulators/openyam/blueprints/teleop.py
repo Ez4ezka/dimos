@@ -21,8 +21,10 @@ from dimos.control.coordinator import TaskConfig
 from dimos.control.tasks.trajectory_task.trajectory_task import joint_trajectory_task
 from dimos.control.teleop_coordinator import TeleopControlCoordinator
 from dimos.core.coordination.blueprints import autoconnect
+from dimos.core.stream import In
 from dimos.manipulation.manipulation_module import ManipulationModule
 from dimos.manipulation.planning.kinematics.config import PinkKinematicsConfig
+from dimos.msgs.sensor_msgs.JointState import JointState
 from dimos.robot.manipulators.common.blueprints import (
     coordinator,
     planner,
@@ -88,17 +90,33 @@ keyboard_teleop_openyam = autoconnect(
     ),
 )
 
+_openyam_keyboard_planner_hw = openyam_hardware()
+
+keyboard_teleop_openyam_planner = autoconnect(
+    KeyboardTeleopModule.blueprint(),
+    planner(model=_openyam_model),
+    coordinator(
+        hardware=[_openyam_keyboard_planner_hw],
+        tasks=[
+            _eef_twist_task(priority=10),
+            _gripper_task(),
+            _trajectory_task(priority=20),
+        ],
+    ),
+)
+
+
 OPENYAM_QUEST_TASK_NAME = "teleop_openyam"
 
 
 def _openyam_quest_hardware(can_port: str | None) -> HardwareComponent:
-    if can_port is None:
-        return openyam_mock_hardware()
-    return openyam_hardware(can_port=can_port)
+    return openyam_mock_hardware() if can_port is None else openyam_hardware(can_port=can_port)
 
 
 class OpenYamTeleopCoordinator(TeleopControlCoordinator):
-    """Select fake or explicit-CAN OpenYAM hardware during coordinator setup."""
+    """Select fake or explicit-CAN hardware when the coordinator starts."""
+
+    policy_joint_command: In[JointState]
 
     def _setup_from_config(self) -> None:
         self.config.hardware = [_openyam_quest_hardware(self.config.g.can_port)]
@@ -115,23 +133,15 @@ _openyam_quest_pink = PinkKinematicsConfig(
     gain=1.0,
 )
 _openyam_quest_hw = openyam_mock_hardware()
-_openyam_quest_model = make_openyam_model_config(name="arm")
+_openyam_quest_model = make_openyam_model_config()
 _openyam_quest_task = teleop_ik_task(
     _openyam_quest_hw,
     robot_model=_openyam_quest_model,
     name=OPENYAM_QUEST_TASK_NAME,
     joint_names=OPENYAM_ARM_JOINTS,
-    priority=10,
+    priority=20,
     solver_type=OpenYamPinkPoseTargetSolver,
-    bindings=[
-        {
-            "hand": "right",
-            "target_frame": _openyam_quest_model.end_effector_link,
-            "gripper_joint": OPENYAM_GRIPPER_JOINT,
-            "gripper_open_position": 1.0,
-            "gripper_closed_position": 0.0,
-        }
-    ],
+    bindings=[{"hand": "right", "target_frame": "yam_hand_tcp"}],
     params={
         "pink": _openyam_quest_pink,
         "timeout": 0.5,
@@ -141,34 +151,42 @@ _openyam_quest_task = teleop_ik_task(
     },
 )
 
-# Single-arm Quest teleop: right controller -> OpenYAM arm
+
+def openyam_quest_tasks(*, include_policy: bool = False) -> list[TaskConfig]:
+    tasks = [
+        _openyam_quest_task,
+        TaskConfig(
+            name=f"{OPENYAM_HARDWARE_ID}_gripper",
+            type="gripper",
+            joint_names=[OPENYAM_GRIPPER_JOINT],
+            priority=20,
+            stream_bind={"gripper_command": "right_gripper_command"},
+        ),
+        _trajectory_task(priority=30),
+    ]
+    if include_policy:
+        tasks.append(
+            TaskConfig(
+                name="policy_rollout",
+                type="servo",
+                joint_names=list(OPENYAM_JOINTS),
+                priority=10,
+                params={"timeout": 0.2},
+                stream_bind={"joint_command": "policy_joint_command"},
+            )
+        )
+    return tasks
+
+
 teleop_quest_openyam = autoconnect(
     ArmTeleopModule.blueprint(),
     OpenYamTeleopCoordinator.blueprint(
         instance_name="ControlCoordinator",
-        tasks=[
-            _openyam_quest_task,
-            _trajectory_task(priority=20),
-        ],
+        tasks=openyam_quest_tasks(),
     ),
     ManipulationModule.blueprint(
-        robots=[_openyam_quest_model],
+        model=_openyam_quest_model,
         kinematics=_openyam_quest_pink,
         visualization={"backend": "viser"},
     ),
 ).remappings([(ArmTeleopModule, "right_controller_output", "right_cartesian_command")])
-
-_openyam_keyboard_planner_hw = openyam_hardware()
-
-keyboard_teleop_openyam_planner = autoconnect(
-    KeyboardTeleopModule.blueprint(),
-    planner(model=_openyam_model),
-    coordinator(
-        hardware=[_openyam_keyboard_planner_hw],
-        tasks=[
-            _eef_twist_task(priority=10),
-            _gripper_task(),
-            _trajectory_task(priority=20),
-        ],
-    ),
-)

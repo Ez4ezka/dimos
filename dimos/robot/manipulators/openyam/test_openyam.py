@@ -233,3 +233,9 @@ def test_keyboard_teleop_openyam_gripper_task_has_no_extra_params() -> None:
 
     assert gripper.joint_names == [OPENYAM_GRIPPER_JOINT]
     assert gripper.params == {}
+
+
+def test_quest_openyam_defaults_to_fake_hardware_at_collection_ready_pose() -> None:
+    hardware = _openyam_quest_hardware(None)
+    assert hardware.adapter_type == "mock_whole_body"
+    assert hardware.adapter_kwargs["initial_positions"] == [*OPENYAM_HOME_JOINTS, 0.0]

@@ -19,6 +19,7 @@ from __future__ import annotations
 import can_motor_control
 from can_motor_control import damiao
 
+from dimos.hardware.spec import JointLimits
 from dimos.hardware.whole_body.damiao.adapter import DamiaoWholeBodyAdapter
 from dimos.robot.assets.model import RobotModel
 from dimos.robot.manipulators.dual_openyam.config import DUAL_OPENYAM_URDF_ARM_JOINTS
@@ -49,8 +50,8 @@ class DualOpenYamDamiaoAdapter(DamiaoWholeBodyAdapter):
     """Two standard YAM follower arms and linear grippers, one bus per side."""
 
     arm_joints = {
-        "left_arm": tuple(f"left_arm/joint{index}" for index in range(1, 7)),
-        "right_arm": tuple(f"right_arm/joint{index}" for index in range(1, 7)),
+        "left_arm": tuple(f"left_joint{index}" for index in range(1, 7)),
+        "right_arm": tuple(f"right_joint{index}" for index in range(1, 7)),
     }
     gripper_joints = {
         "left_gripper": "left_arm/gripper",
@@ -58,6 +59,15 @@ class DualOpenYamDamiaoAdapter(DamiaoWholeBodyAdapter):
     }
     bus_names = ("left", "right")
     kinematic_joint_names = tuple(DUAL_OPENYAM_URDF_ARM_JOINTS)
+
+    def get_limits(self) -> JointLimits:
+        """Declare both grippers in their normalized opening coordinate."""
+        arm_count = len(self.kinematic_joint_names)
+        return JointLimits(
+            position_lower=[*([None] * arm_count), 0.0, 0.0],
+            position_upper=[*([None] * arm_count), 1.0, 1.0],
+            velocity_max=[None] * len(self.joint_names),
+        )
 
     @property
     def kinematic_model(self) -> RobotModel:

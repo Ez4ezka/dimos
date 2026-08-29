@@ -37,9 +37,8 @@ from torch import Tensor
 from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
 from dimos.core.core import rpc
 from dimos.imitation.policy.lerobot.module import (
-    LeRobotPolicyConfig,
     LeRobotPolicyModule,
-    PolicyStatus,
+    RolloutStatus,
 )
 from dimos.msgs.sensor_msgs.Image import Image, ImageFormat
 from dimos.msgs.sensor_msgs.JointState import JointState
@@ -73,28 +72,26 @@ class LeRobotPolicyRuntime(LeRobotPolicyModule):
     """Concrete LeRobot implementation loaded by ``LeRobotPolicyModule``."""
 
     _lock: RLock
-    _loaded_policies: dict[str, _LoadedPolicy]
+    _loaded_policy: _LoadedPolicy | None
     _latest_image: tuple[NDArray[np.uint8], float] | None
     _latest_joint_state: JointState | None
     _stop_event: Event
     _thread: Thread | None
-    _commands_sent: int
+    _commands_published: int
     _last_error: str | None
-    _active_policy_name: str | None
-    _active_task: str
+    _active: bool
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._lock = RLock()
-        self._loaded_policies = {}
+        self._loaded_policy = None
         self._latest_image = None
         self._latest_joint_state = None
         self._stop_event = Event()
         self._thread = None
-        self._commands_sent = 0
+        self._commands_published = 0
         self._last_error = None
-        self._active_policy_name = None
-        self._active_task = ""
+        self._active = False
 
     @rpc
     def start(self) -> None:
@@ -110,100 +107,61 @@ class LeRobotPolicyRuntime(LeRobotPolicyModule):
         super().stop()
 
     @rpc
-    def execute_learned_policy(
+    def start_rollout(
         self,
-        policy_name: str,
         duration: float | None = None,
-    ) -> str:
-        policy = self.config.policies.get(policy_name)
-        if policy is None:
-            available = ", ".join(sorted(self.config.policies))
-            return f"Unknown learned policy {policy_name!r}. Available policies: {available}."
-
-        execution_duration = policy.default_duration if duration is None else duration
-        if execution_duration <= 0:
-            return "Duration must be greater than zero."
-
-        try:
-            with self._lock:
-                if self._thread is not None and self._thread.is_alive():
-                    return f"Learned policy {self._active_policy_name!r} is already running."
-                self._snapshot_observation(time.time())
-                loaded_policy = self._loaded_policies.get(policy_name)
-
-            if loaded_policy is None:
-                newly_loaded_policy = self._load_policy(policy)
-                with self._lock:
-                    loaded_policy = self._loaded_policies.setdefault(
-                        policy_name, newly_loaded_policy
-                    )
-                logger.info(
-                    "Loaded LeRobot policy",
-                    policy=policy_name,
-                    path=policy.policy_path,
-                )
-
-            with self._lock:
-                if self._thread is not None and self._thread.is_alive():
-                    return f"Learned policy {self._active_policy_name!r} is already running."
-                self._snapshot_observation(time.time())
-                cast("_Resettable", loaded_policy.policy).reset()
-                cast("_Resettable", loaded_policy.preprocessor).reset()
-                cast("_Resettable", loaded_policy.postprocessor).reset()
-                self._stop_event.clear()
-                self._commands_sent = 0
-                self._last_error = None
-                self._active_policy_name = policy_name
-                self._active_task = policy.task
-                self._thread = Thread(
-                    target=self._run_policy,
-                    args=(loaded_policy, execution_duration, policy.task),
-                    name=f"lerobot-policy-{policy_name}",
-                    daemon=True,
-                )
-                self._thread.start()
-            return (
-                f"Learned policy {policy_name!r} started for up to {execution_duration:.1f}s. "
-                "Use stop_learned_policy to stop early."
-            )
-        except Exception as exc:
-            with self._lock:
-                self._last_error = str(exc)
-            return f"Learned policy did not start: {exc}"
-
-    @rpc
-    def stop_learned_policy(self) -> str:
-        was_running = self._stop_policy()
-        return "Learned policy stopped." if was_running else "Learned policy was not running."
-
-    @rpc
-    def policy_status(self) -> PolicyStatus:
+    ) -> RolloutStatus:
         with self._lock:
-            running = (
-                self._thread is not None
-                and self._thread.is_alive()
-                and not self._stop_event.is_set()
-            )
-            observation_error: str | None = None
+            if self._thread is not None and self._thread.is_alive():
+                self._last_error = "a policy rollout is already active"
+                return self._status_locked()
+            if duration is not None and duration <= 0:
+                self._last_error = "duration must be greater than zero"
+                return self._status_locked()
             try:
                 self._snapshot_observation(time.time())
             except RuntimeError as exc:
-                observation_error = str(exc)
-            return {
-                "running": running,
-                "observations_ready": observation_error is None,
-                "observation_error": observation_error,
-                "active_policy": self._active_policy_name,
-                "policy_path": (
-                    self.config.policies[self._active_policy_name].policy_path
-                    if self._active_policy_name is not None
-                    else None
-                ),
-                "available_policies": sorted(self.config.policies),
-                "task": self._active_task,
-                "commands_sent": self._commands_sent,
-                "last_error": self._last_error,
-            }
+                self._last_error = str(exc)
+                return self._status_locked()
+
+            self._stop_event.clear()
+            self._commands_published = 0
+            self._last_error = None
+            self._active = True
+            self._thread = Thread(
+                target=self._run_rollout,
+                args=(duration,),
+                name="lerobot-policy-rollout",
+                daemon=True,
+            )
+            self._thread.start()
+            return self._status_locked()
+
+    @rpc
+    def stop_rollout(self) -> RolloutStatus:
+        self._stop_policy()
+        return self.rollout_status()
+
+    @rpc
+    def rollout_status(self) -> RolloutStatus:
+        with self._lock:
+            return self._status_locked()
+
+    def _status_locked(self) -> RolloutStatus:
+        try:
+            self._snapshot_observation(time.time())
+            observations_ready = True
+        except RuntimeError:
+            observations_ready = False
+        return {
+            "active": self._active,
+            "policy_path": self.config.policy_path,
+            "task": self.config.task,
+            "device": self.config.device,
+            "observations_ready": observations_ready,
+            "commands_published": self._commands_published,
+            "last_error": self._last_error,
+        }
 
     def _on_color_image(self, image: Image) -> None:
         rgb = image.to_rgb()
@@ -246,11 +204,11 @@ class LeRobotPolicyRuntime(LeRobotPolicyModule):
             raise RuntimeError("joint state contains non-finite positions")
         return image.copy(), vector
 
-    def _load_policy(self, policy: LeRobotPolicyConfig) -> _LoadedPolicy:
+    def _load_policy(self) -> _LoadedPolicy:
         register_third_party_plugins()
-        policy_config = PreTrainedConfig.from_pretrained(policy.policy_path)
-        if policy.device is not None:
-            policy_config.device = policy.device
+        policy_config = PreTrainedConfig.from_pretrained(self.config.policy_path)
+        if self.config.device is not None:
+            policy_config.device = self.config.device
         if policy_config.device is None:
             raise RuntimeError("LeRobot did not resolve an inference device")
 
@@ -262,10 +220,10 @@ class LeRobotPolicyRuntime(LeRobotPolicyModule):
             )
 
         policy_class = get_policy_class(policy_config.type)
-        loaded_policy = policy_class.from_pretrained(policy.policy_path, config=policy_config)
+        loaded_policy = policy_class.from_pretrained(self.config.policy_path, config=policy_config)
         preprocessor, postprocessor = make_pre_post_processors(
             policy_cfg=policy_config,
-            pretrained_path=policy.policy_path,
+            pretrained_path=self.config.policy_path,
             preprocessor_overrides={"device_processor": {"device": str(device)}},
         )
         return _LoadedPolicy(
@@ -334,21 +292,30 @@ class LeRobotPolicyRuntime(LeRobotPolicyModule):
             action = loaded_policy.postprocessor(action)
         return np.asarray(action.squeeze(0).to("cpu").numpy(), dtype=np.float32)
 
-    def _run_policy(
-        self,
-        loaded_policy: _LoadedPolicy,
-        duration: float,
-        task: str,
-    ) -> None:
+    def _run_rollout(self, duration: float | None) -> None:
         period = 1.0 / self.config.fps
-        deadline = time.monotonic() + duration
+        deadline = None if duration is None else time.monotonic() + duration
+        loaded_policy: _LoadedPolicy | None = None
         try:
-            while not self._stop_event.is_set() and time.monotonic() < deadline:
+            with self._lock:
+                loaded_policy = self._loaded_policy
+            if loaded_policy is None:
+                loaded_policy = self._load_policy()
+                with self._lock:
+                    self._loaded_policy = loaded_policy
+                logger.info("Loaded LeRobot policy", path=self.config.policy_path)
+            if self._stop_event.is_set():
+                return
+            self._reset_policy(loaded_policy)
+
+            while not self._stop_event.is_set() and (
+                deadline is None or time.monotonic() < deadline
+            ):
                 tick_started = time.monotonic()
                 with self._lock:
                     image, state = self._snapshot_observation(time.time())
                 action = np.asarray(
-                    self._predict(loaded_policy, image, state, task=task),
+                    self._predict(loaded_policy, image, state, task=self.config.task),
                     dtype=np.float32,
                 ).reshape(-1)
                 if action.shape != (len(self.config.joint_names),):
@@ -358,7 +325,9 @@ class LeRobotPolicyRuntime(LeRobotPolicyModule):
                     )
                 if not np.all(np.isfinite(action)):
                     raise RuntimeError("policy returned non-finite joint targets")
-                if self._stop_event.is_set() or time.monotonic() >= deadline:
+                if self._stop_event.is_set() or (
+                    deadline is not None and time.monotonic() >= deadline
+                ):
                     break
 
                 self.joint_command.publish(
@@ -368,7 +337,7 @@ class LeRobotPolicyRuntime(LeRobotPolicyModule):
                     )
                 )
                 with self._lock:
-                    self._commands_sent += 1
+                    self._commands_published += 1
                 self._stop_event.wait(max(0.0, period - (time.monotonic() - tick_started)))
         except Exception as exc:
             with self._lock:
@@ -376,12 +345,23 @@ class LeRobotPolicyRuntime(LeRobotPolicyModule):
             logger.exception("LeRobot policy execution stopped", error=str(exc))
         finally:
             self._stop_event.set()
+            if loaded_policy is not None:
+                self._reset_policy(loaded_policy)
+            with self._lock:
+                self._active = False
+
+    @staticmethod
+    def _reset_policy(loaded_policy: _LoadedPolicy) -> None:
+        cast("_Resettable", loaded_policy.policy).reset()
+        cast("_Resettable", loaded_policy.preprocessor).reset()
+        cast("_Resettable", loaded_policy.postprocessor).reset()
 
     def _stop_policy(self) -> bool:
         with self._lock:
             thread = self._thread
             was_running = thread is not None and thread.is_alive()
             self._stop_event.set()
+            self._active = False
         if thread is not None and thread is not current_thread():
             thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
         return was_running

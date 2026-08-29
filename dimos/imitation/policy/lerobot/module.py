@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Host contract for isolated LeRobot policy inference."""
+"""Host contract for isolated LeRobot policy rollout."""
 
 from typing import TypedDict
 
@@ -26,47 +26,37 @@ from dimos.core.isolated_python_module import (
 from dimos.core.stream import In, Out
 from dimos.msgs.sensor_msgs.Image import Image
 from dimos.msgs.sensor_msgs.JointState import JointState
-from dimos.protocol.service.spec import BaseConfig
 
 
-class PolicyStatus(TypedDict):
-    running: bool
-    observations_ready: bool
-    observation_error: str | None
-    active_policy: str | None
-    policy_path: str | None
-    available_policies: list[str]
+class RolloutStatus(TypedDict):
+    """Operator-facing state of the configured policy rollout."""
+
+    active: bool
+    policy_path: str
     task: str
-    commands_sent: int
+    device: str | None
+    observations_ready: bool
+    commands_published: int
     last_error: str | None
 
 
-class LeRobotPolicyConfig(BaseConfig):
-    """Configuration for one named learned policy."""
+class LeRobotPolicyModuleConfig(IsolatedPythonModuleConfig):
+    """Configuration for one checkpoint shared with the isolated runtime."""
 
-    policy_path: str
+    policy_path: str = Field(min_length=1)
     task: str = ""
     device: str | None = None
-    default_duration: float = Field(default=10.0, gt=0)
-
-
-class LeRobotPolicyModuleConfig(IsolatedPythonModuleConfig):
-    """Configuration shared by the host contract and isolated runtime."""
-
-    policies: dict[str, LeRobotPolicyConfig] = Field(min_length=1)
     joint_names: list[str] = Field(min_length=1)
     fps: float = Field(default=30.0, gt=0)
     robot_type: str = ""
     max_observation_age_s: float = Field(default=0.5, gt=0)
 
-    @field_validator("policies")
+    @field_validator("policy_path")
     @classmethod
-    def policy_names_must_not_be_empty(
-        cls, policies: dict[str, LeRobotPolicyConfig]
-    ) -> dict[str, LeRobotPolicyConfig]:
-        if any(not name.strip() for name in policies):
-            raise ValueError("policy names must not be empty")
-        return policies
+    def policy_path_must_not_be_blank(cls, policy_path: str) -> str:
+        if not policy_path.strip():
+            raise ValueError("policy_path must not be blank")
+        return policy_path
 
     @field_validator("joint_names")
     @classmethod
@@ -87,20 +77,19 @@ class LeRobotPolicyModule(IsolatedPythonModule):
     joint_command: Out[JointState]
 
     @rpc
-    def execute_learned_policy(
+    def start_rollout(
         self,
-        policy_name: str,
         duration: float | None = None,
-    ) -> str:
-        """Execute a configured learned policy against live camera and robot state."""
+    ) -> RolloutStatus:
+        """Start the configured policy until stopped, preempted, or duration expires."""
         raise NotImplementedError
 
     @rpc
-    def stop_learned_policy(self) -> str:
-        """Stop the running learned policy and hold the last commanded pose."""
+    def stop_rollout(self) -> RolloutStatus:
+        """Stop rollout publication and clear the policy action queue."""
         raise NotImplementedError
 
     @rpc
-    def policy_status(self) -> PolicyStatus:
-        """Return live execution status for CLIs and monitoring."""
+    def rollout_status(self) -> RolloutStatus:
+        """Return the lifecycle and observation state of the configured policy."""
         raise NotImplementedError
