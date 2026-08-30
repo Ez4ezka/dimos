@@ -57,7 +57,7 @@ def _eef_twist_task(*, priority: int = 10) -> TaskConfig:
         type="eef_twist",
         joint_names=list(OPENYAM_ARM_JOINTS),
         priority=priority,
-        params={"robot_model": _openyam_model, "target_frame": "yam_hand_tcp"},
+        params={"robot_model": _openyam_model, "target_frame": "gripper_tip"},
     )
 
 
@@ -141,7 +141,7 @@ _openyam_quest_task = teleop_ik_task(
     joint_names=OPENYAM_ARM_JOINTS,
     priority=20,
     solver_type=OpenYamPinkPoseTargetSolver,
-    bindings=[{"hand": "right", "target_frame": "yam_hand_tcp"}],
+    bindings=[{"hand": "right", "target_frame": "gripper_tip"}],
     params={
         "pink": _openyam_quest_pink,
         "timeout": 0.5,
