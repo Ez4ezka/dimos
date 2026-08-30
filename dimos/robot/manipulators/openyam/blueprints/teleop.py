@@ -168,10 +168,9 @@ def openyam_quest_tasks(*, include_policy: bool = False) -> list[TaskConfig]:
         tasks.append(
             TaskConfig(
                 name="policy_rollout",
-                type="servo",
+                type="trajectory",
                 joint_names=list(OPENYAM_JOINTS),
                 priority=10,
-                params={"timeout": 0.2},
                 stream_bind={"joint_command": "policy_joint_command"},
             )
         )
