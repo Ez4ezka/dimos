@@ -86,6 +86,7 @@ all_blueprints = {
     "mid360-realsense-record-with-pcap": "dimos.robot.assembly.mid360_realsense_30:mid360_realsense_record_with_pcap",
     "openarm-planner-coordinator": "dimos.robot.manipulators.openarm.blueprints.basic:openarm_planner_coordinator",
     "openyam-planner-coordinator": "dimos.robot.manipulators.openyam.blueprints.basic:openyam_planner_coordinator",
+    "r1pro-planner-coordinator": "dimos.robot.manipulators.r1pro.blueprints.basic:r1pro_planner_coordinator",
     "real-sense-camera-vis": "dimos.hardware.sensors.camera.realsense.blueprints:real_sense_camera_vis",
     "spot": "dimos.experimental.robot.bosdyn.spot.blueprints.spot:spot",
     "spot-record": "dimos.experimental.robot.bosdyn.spot.blueprints.spot_record:spot_record",

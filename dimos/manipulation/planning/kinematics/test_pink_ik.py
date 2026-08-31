@@ -218,6 +218,13 @@ class _FakePostureTask:
         self.target = configuration.q.copy()
 
 
+class _FakeLinearHolonomicTask:
+    def __init__(self, A: np.ndarray, b: np.ndarray, q_0: np.ndarray) -> None:
+        self.A = A
+        self.b = b
+        self.q_0 = q_0
+
+
 class _AuxiliaryTask:
     def __init__(self, value: float) -> None:
         self.value = value
@@ -302,7 +309,11 @@ def _fake_modules(converge: bool = True) -> _FakeModules:
 
     pink = ModuleType("pink")
     pink.Configuration = _FakeConfiguration  # type: ignore[attr-defined]
-    pink.tasks = SimpleNamespace(FrameTask=_FakeFrameTask, PostureTask=_FakePostureTask)
+    pink.tasks = SimpleNamespace(
+        FrameTask=_FakeFrameTask,
+        LinearHolonomicTask=_FakeLinearHolonomicTask,
+        PostureTask=_FakePostureTask,
+    )
 
     def solve_ik(
         configuration: _FakeConfiguration,
@@ -456,6 +467,42 @@ def test_create_kinematics_pink_returns_backend(mocker: MockerFixture) -> None:
     _install_fake_modules(mocker)
 
     assert isinstance(create_kinematics("pink"), PinkIK)
+
+
+def test_locked_joints_are_constrained_in_the_pink_qp(mocker: MockerFixture) -> None:
+    modules = _install_fake_modules(mocker)
+    ik = PinkIK(PinkIKConfig())
+    context = _context()
+    seed_q = np.array([0.1, 0.2, 0.3])
+
+    constraints = ik._locked_joint_constraints(
+        context,
+        seed_q,
+        {0: -0.4, 2: 0.6},
+    )
+
+    assert len(constraints) == 1
+    constraint = cast("_FakeLinearHolonomicTask", constraints[0])
+    assert constraint.A == pytest.approx(
+        np.array(
+            [
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+    )
+    assert constraint.b == pytest.approx([0.0, 0.0])
+    assert constraint.q_0 == pytest.approx([0.1, -0.4, 0.6])
+
+    solve_ik = mocker.patch.object(modules.pink, "solve_ik", return_value=np.zeros(3))
+    ik._step_configuration(
+        configuration=_FakeConfiguration(context.model, context.data, seed_q),
+        tasks={},
+        dt=0.05,
+        constraints=constraints,
+    )
+
+    assert solve_ik.call_args.kwargs["constraints"] == constraints
 
 
 def test_create_kinematics_pink_config_passes_tuning(
