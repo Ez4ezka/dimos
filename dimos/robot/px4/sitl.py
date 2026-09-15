@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FakeA8: a gimbal device for SITL, which has none.
+"""What PX4 SITL lacks: the A8 gimbal. ``FakeA8`` stands in for it in ``px4-sitl``.
 
-Consumes ``gimbal_target`` and reports ``gimbal_attitude`` the way the connection would
+It consumes ``gimbal_target`` and reports ``gimbal_attitude`` the way the connection does
 from the real A8 (10 Hz, radians, follow-mode flags), slewing toward the target at the
-A8's rate. On the aircraft the same two ports are the connection's; this module is
-interchangeable with it in a blueprint.
+A8's rate. On the aircraft the same two ports are the connection's, so SiyiA8Gimbal and
+the perception bridge cannot tell the difference. The camera has its own stand-in
+(``RtspCamera`` with ``url="synthetic"``).
 """
 
 from __future__ import annotations

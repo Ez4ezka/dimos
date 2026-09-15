@@ -12,25 +12,115 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SiyiA8Gimbal on the synthetic attitude record. No A8, no MAVLink, no transports."""
+"""SIYI A8 mini: frame maths, the SDK packet format, and the gimbal Module on a synthetic
+attitude record. No A8, no MAVLink, no transports."""
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 import math
+import struct
 from typing import Any
 
 import pytest
 
+from dimos.hardware.gimbal.siyi.frame import (
+    BENCH_MOUNT,
+    FLAG_YAW_IN_VEHICLE_FRAME,
+    FLAG_YAW_LOCK,
+    FLIGHT_MOUNT,
+    decode_flags,
+    normalize_attitude,
+    quat_to_euler_deg,
+)
 from dimos.hardware.gimbal.siyi.gimbal import SiyiA8Gimbal
 from dimos.hardware.gimbal.siyi.replay import (
     A8_FOLLOW_FLAGS,
     load_attitude_record,
     synthetic_attitude_record,
 )
+from dimos.hardware.gimbal.siyi.sdk import (
+    CMD_ATTITUDE,
+    CMD_CODEC_GET,
+    CODEC_H265,
+    STREAM_SUB,
+    CodecSpec,
+    build_packet,
+    crc16,
+    parse_attitude,
+    parse_packet,
+    parse_zoom,
+)
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Quaternion import Quaternion
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
+
+
+def _quat_wxyz(roll: float, pitch: float, yaw: float) -> list[float]:
+    """ZYX euler (degrees) -> MAVLink [w, x, y, z]."""
+    r, p, y = (math.radians(a) / 2.0 for a in (roll, pitch, yaw))
+    cr, sr, cp, sp, cy, sy = (
+        math.cos(r),
+        math.sin(r),
+        math.cos(p),
+        math.sin(p),
+        math.cos(y),
+        math.sin(y),
+    )
+    return [
+        cr * cp * cy + sr * sp * sy,
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+    ]
+
+
+def test_quat_to_euler_roundtrip() -> None:
+    roll, pitch, yaw = quat_to_euler_deg(_quat_wxyz(10.0, -30.0, 45.0))
+    assert (roll, pitch, yaw) == pytest.approx((10.0, -30.0, 45.0))
+
+
+def test_flight_mount_uses_raw_angles() -> None:
+    # Verified 2026-09-04 in the flight mount: --set 0 45 -> yaw +43.9, --set 20 0 -> pitch +20.
+    pitch, yaw = normalize_attitude(_quat_wxyz(0.0, 20.0, 45.0), FLIGHT_MOUNT)
+    assert (pitch, yaw) == pytest.approx((20.0, 45.0))
+
+
+def test_bench_mount_negates_pitch_and_shifts_yaw() -> None:
+    # Base-down on the bench the A8 reports roll 180 and yaw +180.
+    pitch, yaw = normalize_attitude(_quat_wxyz(180.0, -20.0, -135.0), BENCH_MOUNT)
+    assert (pitch, yaw) == pytest.approx((20.0, 45.0))
+
+
+def test_decode_flags() -> None:
+    assert decode_flags(0) == "none"
+    assert (
+        decode_flags(FLAG_YAW_LOCK | FLAG_YAW_IN_VEHICLE_FRAME) == "YAW_LOCK|YAW_IN_VEHICLE_FRAME"
+    )
+
+
+def test_packet_roundtrip_and_crc() -> None:
+    pkt = build_packet(CMD_ATTITUDE, seq=7)
+    assert pkt[:3] == b"\x55\x66\x01"
+    assert parse_packet(pkt) == (CMD_ATTITUDE, b"")
+    corrupted = pkt[:-1] + bytes([pkt[-1] ^ 0xFF])
+    assert parse_packet(corrupted) is None
+    assert crc16(pkt[:-2]) == struct.unpack("<H", pkt[-2:])[0]
+
+
+def test_attitude_and_zoom_parsing() -> None:
+    body = struct.pack("<hhhhhh", -438, 200, 1800, 0, 0, 0)
+    assert parse_attitude(body) == (-43.8, 20.0, 180.0)  # SIYI yaw sign is opposite MAVLink
+    assert parse_zoom(bytes([2, 5])) == 2.5
+
+
+def test_codec_spec_payload_roundtrip() -> None:
+    spec = CodecSpec(stream=STREAM_SUB, codec=CODEC_H265, width=640, height=360, bitrate_kbps=400)
+    pkt = build_packet(CMD_CODEC_GET, spec.payload())
+    cmd, body = parse_packet(pkt) or (None, b"")
+    assert cmd == CMD_CODEC_GET
+    assert CodecSpec.from_body(body) == spec
+
 
 _FORBIDDEN_RPCS = {"arm", "set_mode", "send_gimbal_pitchyaw", "claim_gimbal_control"}
 

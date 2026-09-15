@@ -22,12 +22,13 @@ from typing import Any
 
 import pytest
 
-from dimos.robot.px4.link_monitor import LinkMonitor, estimate_uplink_bps
-from dimos.robot.px4.link_sources import (
+from dimos.robot.px4.link_monitor import (
     SCENARIOS,
+    LinkMonitor,
     ModemReading,
     PathReading,
     PingReading,
+    estimate_uplink_bps,
     parse_ping,
     parse_qcsq,
     parse_qeng_servingcell,

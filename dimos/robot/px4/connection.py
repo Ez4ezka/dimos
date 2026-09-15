@@ -22,8 +22,8 @@ Consumes teleop ``cmd_vel``, the perception target and E-STOP.
 Mirrors ``dimos/robot/galaxea/r1pro/connection.py``: Field-defaulted config, lazy driver
 import in ``start()``, socket opened in ``start()`` never ``__init__``, per-message stat
 counters behind a ``sensor_stats`` RPC, a drift-free publish loop, and the static mount
-edge republished on every tf tick. The flight logic (``supervisor_core.py``), the socket
-(``mavlink/io.py``) and the timed buffers (``mavlink/vehicle_state.py``) are plain classes
+edge republished on every tf tick. The flight logic (``supervisor_core.py``) and the
+MAVLink layer (``mavlink.py``: socket, vehicle state, timebase, frames) are plain classes
 this module owns, the way R1ProConnection owns its RawROS nodes and sensor workers.
 
 Safety invariants (README): the RC pilot always wins; exactly one writer of Offboard
@@ -94,23 +94,27 @@ from dimos.robot.px4.config import (
     GuidanceConfig,
     SupervisorLimits,
 )
-from dimos.robot.px4.frames import (
+from dimos.robot.px4.mavlink import (
+    MAIN_AUTO,
+    MSG_ID_SYSTEM_TIME,
+    SUB_AUTO_LOITER,
+    MavlinkIO,
+    Px4Timebase,
+    VehicleSnapshot,
+    VehicleState,
     frd_to_flu,
+    mode_name,
     ned_to_flu,
     ned_yaw_to_flu_yaw,
     quaternion_from_ned_euler,
 )
-from dimos.robot.px4.guidance import TargetEstimate
-from dimos.robot.px4.mavlink.io import MSG_ID_SYSTEM_TIME, MavlinkIO
-from dimos.robot.px4.mavlink.timebase import Px4Timebase
-from dimos.robot.px4.mavlink.vehicle_state import VehicleSnapshot, VehicleState
-from dimos.robot.px4.px4_modes import MAIN_AUTO, SUB_AUTO_LOITER, mode_name
 from dimos.robot.px4.supervisor_core import (
     ARMED_STATES,
     GUIDANCE_MODES,
     GuidanceMode,
     Rejection,
     SupervisorCore,
+    TargetEstimate,
     TeleopCommand,
 )
 from dimos.utils.angles import clamp
@@ -219,7 +223,7 @@ class Px4DroneConnection(Module):
     gimbal_target: In[JointState]
     estop_in: In[Bool]
 
-    # Perception inputs (PerceptionBridge or FakeTarget).
+    # Perception inputs (PerceptionBridge).
     target_state: In[Odometry]
     target_valid: In[Bool]
     target_los: In[PoseStamped]

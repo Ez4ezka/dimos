@@ -26,8 +26,7 @@ from __future__ import annotations
 import math
 import time
 
-from dimos.robot.px4.link_monitor import LinkMonitor
-from dimos.robot.px4.link_sources import SCENARIOS
+from dimos.robot.px4.link_monitor import SCENARIOS, LinkMonitor
 
 # Expected usable uplink band (bps) per scenario, from the measurements.
 _UPLINK_BANDS = {

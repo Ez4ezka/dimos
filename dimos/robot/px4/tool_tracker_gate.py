@@ -44,11 +44,10 @@ from dimos.msgs.nav_msgs.Odometry import Odometry
 from dimos.msgs.px4_msgs.CommandEvent import CommandEvent
 from dimos.msgs.px4_msgs.TrackedCommand import TrackedCommand
 from dimos.msgs.px4_msgs.VehicleStatus import VehicleStatus
-from dimos.msgs.std_msgs.Float32 import Float32
 from dimos.msgs.std_msgs.String import String
-from dimos.robot.px4.blueprints.basic.px4_basic import zenoh_transport
+from dimos.robot.px4.blueprints import px4_transports
 from dimos.robot.px4.command_tracker import CommandTracker
-from dimos.robot.px4.px4_modes import LANDED_IN_AIR, MAIN_OFFBOARD
+from dimos.robot.px4.mavlink import LANDED_IN_AIR, MAIN_OFFBOARD
 
 EXPECTED = [("ok", ""), ("ok", ""), ("rejected", "not_teleop"), ("rejected", "estop_latched")]
 
@@ -171,20 +170,7 @@ class FakePx4Feed(Module):
 
 def main() -> int:
     blueprint = autoconnect(FakePx4Feed.blueprint(), CommandTracker.blueprint()).transports(
-        {
-            ("command_event", CommandEvent): zenoh_transport("/command_event", CommandEvent),
-            ("offboard_setpoint", Odometry): zenoh_transport("/offboard_setpoint", Odometry),
-            ("odometry", Odometry): zenoh_transport("/odometry", Odometry, latest_wins=True),
-            ("vehicle_status", VehicleStatus): zenoh_transport("/vehicle_status", VehicleStatus),
-            ("supervisor_state", String): zenoh_transport("/supervisor_state", String),
-            ("supervisor_status", String): zenoh_transport("/supervisor_status", String),
-            ("tracked_command", TrackedCommand): zenoh_transport(
-                "/tracked_command", TrackedCommand
-            ),
-            ("command_report", String): zenoh_transport("/command_report", String),
-            ("cmd_forward", Float32): zenoh_transport("/cmd_forward", Float32),
-            ("meas_forward", Float32): zenoh_transport("/meas_forward", Float32),
-        }
+        px4_transports()
     )
     parsed = BlueprintConfigParser(blueprint).parse(
         environ={}, overrides={"g": {"viewer": "none", "transport": "zenoh", "n_workers": 1}}

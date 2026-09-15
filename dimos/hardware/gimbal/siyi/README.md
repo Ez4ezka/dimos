@@ -20,11 +20,10 @@ pitch earth-stabilised (flight mount, verified 2026-09-04).
 ## Tests and gates
 
 ```bash
-uv run pytest dimos/hardware/gimbal                        # synthetic attitude record, no A8
-uv run python dimos/robot/px4/tool_bench_gate.py           # with PX4 SITL and FakeA8
-dimos run siyi-a8-gimbal-vis                               # beside a running connection
-dimos run siyi-a8-gimbal                                   # the module alone
-dimos run px4-bench                                        # on the aircraft, props off
+uv run pytest dimos/hardware/gimbal                        # frame maths, SDK packets, the module; no A8
+uv run python dimos/robot/px4/tool_sitl_gate.py            # with PX4 SITL and FakeA8: tf chain, aim
+dimos run siyi-a8-gimbal                                   # the module alone, beside a running connection
+dimos run px4-drone                                        # on the aircraft
 ```
 
 A bench capture of `gimbal_attitude` (JSONL, degrees) loads with

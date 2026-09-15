@@ -17,15 +17,13 @@
 Consumes the camera's decoded frames and the connection's odometry, gimbal attitude,
 home-relative pose and status, and publishes the exact three streams the connection
 reads for FOLLOW and YAW_TRACK: ``target_state``, ``target_valid``, ``target_los``.
-FakeTarget publishes the same three, so the two are interchangeable in a blueprint.
+Without it the connection simply never leaves HOVER for FOLLOW or YAW_TRACK.
 
 The four flown scripts (``yolo_live_trackfeed``, ``track_manager_select``,
 ``los_estimator``, ``target_estimator``) talked over UDP because they were processes; in
-one process a frame goes detector, tracker, LOS, Kalman as function calls, so the inbound
-fan-out ports are gone. The outbound JSON the flown gimbal controller (5608) and the
-laptop viewer (5605, 5613) read is still emitted behind ``legacy_udp_fanout`` so nothing
-on the aircraft breaks during the transition. The geometry and tracker parameters are the
-ones that flew (``perception/``).
+one process a frame goes detector, tracker, LOS, Kalman as function calls, so the UDP
+ports are gone. The geometry and tracker parameters are the ones that flew (the sibling
+files in this directory).
 
 Operator click-to-select arrives on ``track_select`` as a pixel in the published frame;
 a NaN point clears the selection, the convention MovementManager uses to cancel a goal.
@@ -33,11 +31,8 @@ a NaN point clears the selection, the convention MovementManager uses to cancel 
 
 from __future__ import annotations
 
-from dataclasses import asdict
-import json
 import math
 import queue
-import socket
 import threading
 import time
 from typing import Any, Literal
@@ -63,8 +58,7 @@ from dimos.msgs.px4_msgs.VehicleStatus import VehicleStatus
 from dimos.msgs.sensor_msgs.Image import Image, ImageFormat
 from dimos.msgs.sensor_msgs.JointState import JointState
 from dimos.msgs.vision_msgs.Detection2DArray import Detection2DArray
-from dimos.robot.px4.frames import flu_to_ned, ned_to_flu
-from dimos.robot.px4.mavlink.vehicle_state import TimedBuffer
+from dimos.robot.px4.mavlink import TimedBuffer, flu_to_ned, ned_to_flu
 from dimos.robot.px4.perception.detector import BrightBlobDetector, Detector, UltralyticsDetector
 from dimos.robot.px4.perception.estimators import (
     EstimatorConfig,
@@ -86,11 +80,6 @@ from dimos.utils.logging_config import setup_logger
 
 logger = setup_logger()
 
-# Flown fan-out destinations (SYSTEM.md port table).
-LEGACY_GIMBAL_CONTROL_PORT = 5608
-LEGACY_VIEWER_TRACKS_PORT = 5605
-LEGACY_VIEWER_TARGET_PORT = 5613
-
 
 class PerceptionBridgeConfig(ModuleConfig):
     # "ultralytics" runs YOLO (a .pt anywhere, or the Jetson's TensorRT .engine); "blob"
@@ -108,9 +97,6 @@ class PerceptionBridgeConfig(ModuleConfig):
     assume_zoom_1x: bool = Field(default=True)
     # A click selects the track whose box contains it, else the nearest centre within this.
     select_radius_px: float = Field(default=80.0)
-    # Keep feeding the flown gimbal controller and laptop viewer their JSON.
-    legacy_udp_fanout: bool = Field(default=True)
-    legacy_laptop_ip: str = Field(default="")
     sensor_stats_interval_s: float = Field(default=10.0)
 
 
@@ -160,7 +146,6 @@ class PerceptionBridge(Module):
         self._queue: queue.Queue[Image | None] = queue.Queue(maxsize=1)
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
-        self._udp: socket.socket | None = None
 
     # Lifecycle
 
@@ -168,8 +153,6 @@ class PerceptionBridge(Module):
     def start(self) -> None:
         super().start()
         self._detector = self.make_detector()
-        if self.config.legacy_udp_fanout:
-            self._udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.register_disposable(Disposable(self.color_image.subscribe(self._on_frame)))
         self.register_disposable(Disposable(self.odometry.subscribe(self._on_odometry)))
         self.register_disposable(Disposable(self.gimbal_attitude.subscribe(self._on_gimbal)))
@@ -192,9 +175,6 @@ class PerceptionBridge(Module):
         if self._worker is not None:
             self._worker.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
             self._worker = None
-        if self._udp is not None:
-            self._udp.close()
-            self._udp = None
         super().stop()
 
     def make_detector(self) -> Detector:
@@ -312,7 +292,7 @@ class PerceptionBridge(Module):
         with self._lock:
             self._last_los, self._last_state = los, state
             self._frames += 1
-        self._publish(tracks, los, state, image, w, h)
+        self._publish(tracks, los, state, image)
         return state
 
     def _geo(self, capture_time: float, now: float) -> tuple[VehicleGeo, GimbalGeo | None]:
@@ -352,8 +332,6 @@ class PerceptionBridge(Module):
         los: LosResult,
         state: TargetState,
         image: Image,
-        w: int,
-        h: int,
     ) -> None:
         self.tracks.publish(_detections(tracks, image.ts, self.config.optical_frame_id))
         self.target_valid.publish(Bool(data=state.valid))
@@ -385,50 +363,6 @@ class PerceptionBridge(Module):
                     ),
                 )
             )
-        if self._udp is not None:
-            self._legacy_fanout(tracks, los, state, image.ts, w, h)
-
-    def _legacy_fanout(
-        self,
-        tracks: list[TrackOutput],
-        los: LosResult,
-        state: TargetState,
-        ts: float,
-        w: int,
-        h: int,
-    ) -> None:
-        assert self._udp is not None
-        cfg = self.config
-        with self._lock:
-            selected = self._selected
-        packet = {
-            "schema": "tracks_select_v1",
-            "selected_track_id": selected,
-            "frame_id": self._frames,
-            "width": w,
-            "height": h,
-            "tracks": [asdict(t) for t in tracks],
-            "timestamp": ts,
-            "capture_time": ts,
-        }
-        payload = json.dumps(packet, separators=(",", ":")).encode()
-        dests = [("127.0.0.1", LEGACY_GIMBAL_CONTROL_PORT)]
-        if cfg.legacy_laptop_ip:
-            dests.append((cfg.legacy_laptop_ip, LEGACY_VIEWER_TRACKS_PORT))
-        for d in dests:
-            try:
-                self._udp.sendto(payload, d)
-            except OSError:
-                pass
-        if cfg.legacy_laptop_ip:
-            target = {"schema": "target_state_v1", **asdict(state), "los_valid": los.valid}
-            try:
-                self._udp.sendto(
-                    json.dumps(target, separators=(",", ":")).encode(),
-                    (cfg.legacy_laptop_ip, LEGACY_VIEWER_TARGET_PORT),
-                )
-            except OSError:
-                pass
 
     # RPCs
 

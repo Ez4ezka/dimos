@@ -28,13 +28,17 @@ Decoding: PyAV in-process (``decoder="av"``, any machine) or the Jetson's NVDEC 
 ``gst-launch-1.0`` subprocess (``decoder="gst-nv"``). The Orin Nano decodes H.265 in
 hardware but has no hardware encoder, so nothing here ever re-encodes: a lower bitrate for
 the link comes from the camera's own codec settings (:mod:`dimos.hardware.gimbal.siyi.sdk`).
-A local file path instead of an RTSP URL replays a capture through the same code.
+A local file path instead of an RTSP URL replays a capture through the same code, and
+``url="synthetic"`` generates a short clip at start (a white square parked at the image
+centre) so the simulator twin has a camera without any file on disk.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from pathlib import Path
 import subprocess
+import tempfile
 import threading
 import time
 from typing import Any, Literal
@@ -48,6 +52,7 @@ from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In, Out
 from dimos.hardware.gimbal.siyi.sdk import A8_IP, STREAM_MAIN, STREAM_SUB, CodecSpec, SiyiSdk
+from dimos.hardware.sensors.camera.rtsp.synthetic import write_synthetic_h265
 from dimos.msgs.foxglove_msgs.CompressedVideo import CompressedVideo
 from dimos.msgs.link_msgs.LinkPolicy import LinkPolicy
 from dimos.msgs.sensor_msgs.CompressedImage import CompressedImage
@@ -57,6 +62,7 @@ from dimos.utils.logging_config import setup_logger
 logger = setup_logger()
 
 A8_RTSP_URL = f"rtsp://{A8_IP}:8554/main.264"
+SYNTHETIC_URL = "synthetic"
 _RECONNECT_WAIT_S = 2.0
 
 
@@ -73,7 +79,8 @@ class _StreamStat:
 
 
 class RtspCameraConfig(ModuleConfig):
-    # RTSP URL of the camera, or a local file path to replay a capture.
+    # RTSP URL of the camera, a local file path to replay a capture, or "synthetic" for a
+    # generated clip (SITL twin, tests).
     url: str = Field(default=A8_RTSP_URL)
     rtsp_transport: Literal["tcp", "udp"] = Field(default="tcp")
     # rtspsrc / ffmpeg jitter buffer. 50 ms was flown; larger only if the wired link drops.
@@ -156,6 +163,8 @@ class RtspCamera(Module):
         self._sdk: SiyiSdk | None = None
         self._gst: subprocess.Popen[bytes] | None = None
         self._frame_size: tuple[int, int] | None = None
+        # What av.open gets: the URL, the file, or the generated clip once start() wrote it.
+        self._source = self.config.url
 
     # Lifecycle
 
@@ -163,6 +172,10 @@ class RtspCamera(Module):
     def start(self) -> None:
         super().start()
         cfg = self.config
+        if cfg.url == SYNTHETIC_URL:
+            clip = Path(tempfile.mkdtemp(prefix="rtsp-synthetic-")) / "synthetic.mp4"
+            write_synthetic_h265(clip, width=320, height=180, fps=25, seconds=2.0, centered=True)
+            self._source = str(clip)
         if cfg.sdk_enabled:
             self._sdk = SiyiSdk(cfg.sdk_ip)
             self._sdk.open()
@@ -215,7 +228,7 @@ class RtspCamera(Module):
     # Relay
 
     def _is_file(self) -> bool:
-        return "://" not in self.config.url
+        return "://" not in self._source
 
     def _relay_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -223,7 +236,7 @@ class RtspCamera(Module):
                 self.relay_once()
             except (av.FFmpegError, OSError, IndexError, ValueError) as exc:
                 self._count("video", errors=1)
-                logger.warning("camera stream unavailable", url=self.config.url, error=str(exc))
+                logger.warning("camera stream unavailable", url=self._source, error=str(exc))
                 self._stop_event.wait(_RECONNECT_WAIT_S)
                 continue
             if self._is_file() and not self.config.replay_loop:
@@ -244,7 +257,7 @@ class RtspCamera(Module):
         # A frame comes out of the decoder from a later packet than its own (lookahead),
         # so stamps are kept by pts and handed to the frame they belong to.
         stamps: dict[int | None, float] = {}
-        with av.open(cfg.url, options=options, timeout=(3.0, 3.0)) as container:
+        with av.open(self._source, options=options, timeout=(3.0, 3.0)) as container:
             stream = container.streams.video[0]
             if stream.codec_context.name != cfg.expected_codec:
                 raise ValueError(f"expected {cfg.expected_codec}, got {stream.codec_context.name}")
@@ -328,7 +341,7 @@ class RtspCamera(Module):
                 continue
             width, height = size
             nbytes = width * height * 4
-            cmd = gst_nv_pipeline(cfg.url, cfg.rtsp_latency_ms, width, height, cfg.color_hz)
+            cmd = gst_nv_pipeline(self._source, cfg.rtsp_latency_ms, width, height, cfg.color_hz)
             self._gst = subprocess.Popen(cmd, stdout=subprocess.PIPE)
             assert self._gst.stdout is not None
             while not self._stop_event.is_set():

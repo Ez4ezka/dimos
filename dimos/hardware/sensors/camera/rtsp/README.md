@@ -30,11 +30,12 @@ vehicle attitude for line-of-sight geometry. The bench gate measures the residua
 
 ```bash
 uv run pytest dimos/hardware/sensors/camera/rtsp           # synthetic H.265 clip, no camera
-uv run python dimos/robot/px4/tool_bench_gate.py           # with PX4 SITL: stamps, tf, aim
+uv run python dimos/robot/px4/tool_sitl_gate.py            # with PX4 SITL: frame stamps vs the vehicle clock
 dimos run rtsp-camera-vis                                  # the A8, or --rtspcamera.url=clip.mp4
 dimos run rtsp-camera                                      # the module alone
-dimos run px4-bench                                        # on the aircraft, props off
+dimos run px4-drone                                        # on the aircraft
 ```
 
-The synthetic clip (`synthetic.py`) stands in until a real A8 capture is recorded on the
-bench; a capture replays through the same code by passing its path as `url`.
+`url` is the RTSP URL, a file path (a capture replays through the same code), or
+`synthetic`: a short clip generated at start by `synthetic.py`, which is what `px4-sitl`
+uses until a real A8 capture is recorded on the bench.

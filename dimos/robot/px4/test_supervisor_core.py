@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Supervisor state machine against a fake vehicle and a fake actuator.
+"""Guidance laws and the supervisor state machine against a fake vehicle and actuator.
 
-Ported 1:1 from drone-autonomy ``tests/test_guidance.py:92-213`` (the suite that
-gated the 2026-09-09 flight). Same cases, same numbers, same assertions; only the
-call shapes changed (typed commands, snapshots, the actuator protocol).
+Ported 1:1 from drone-autonomy ``tests/test_guidance.py`` (the suite that gated the
+2026-09-09 flight). Same cases, same numbers, same assertions; only the call shapes changed
+(typed commands, snapshots, the actuator protocol).
 """
 
 from __future__ import annotations
@@ -25,19 +25,58 @@ import math
 import time
 from typing import Any
 
-from dimos.robot.px4 import px4_modes as px
-from dimos.robot.px4.config import GuidanceConfig, SupervisorLimits
-from dimos.robot.px4.guidance import TargetEstimate
-from dimos.robot.px4.mavlink.vehicle_state import VehicleSnapshot, VehicleState
-from dimos.robot.px4.supervisor_core import SupervisorCore, TakeoffPoint
+from dimos.robot.px4 import mavlink as px
+from dimos.robot.px4.config import FollowConfig, GuidanceConfig, SupervisorLimits
+from dimos.robot.px4.mavlink import VehicleSnapshot, VehicleState
+from dimos.robot.px4.supervisor_core import (
+    SupervisorCore,
+    TakeoffPoint,
+    TargetEstimate,
+    follow_velocity,
+    rate_limit_yaw,
+    yaw_track_rate,
+)
 
 CFG = SupervisorLimits()
 GCFG = GuidanceConfig()
 YT = GCFG.yaw_track
+FO = FollowConfig()
 
 
 def close(a: float, b: float, tol: float = 0.05) -> None:
     assert abs(a - b) <= tol, (a, b)
+
+
+def test_yaw_track_deadband_and_limit() -> None:
+    assert yaw_track_rate(10.0, True, YT) == 0.0
+    assert yaw_track_rate(40.0, False, YT) == 0.0
+    assert yaw_track_rate(None, True, YT) == 0.0
+    r = yaw_track_rate(40.0, True, YT)
+    close(r, YT.k_yaw * 25.0)
+    assert yaw_track_rate(-89.0, True, YT) == -YT.max_yaw_rate_dps
+
+
+def test_follow_geometry() -> None:
+    tgt = TargetEstimate(valid=True, n=30.0, e=0.0, vn=0.0, ve=0.0)
+    c = follow_velocity(0.0, 0.0, -10.0, 0.0, tgt, FO)
+    close(c.range_m, 30.0)
+    close(c.bearing_deg, 0.0)
+    assert c.vn > 0 and abs(c.ve) < 1e-9  # closes toward target
+    assert math.hypot(c.vn, c.ve) <= FO.v_max_mps + 1e-9
+    close(c.vd, 0.0)  # already at 10 m
+    tgt = TargetEstimate(valid=True, n=12.5, e=0.0, vn=0.0, ve=0.0)
+    c = follow_velocity(0.0, 0.0, -5.0, 0.0, tgt, FO)
+    close(c.vn, 0.0)  # inside deadband
+    assert c.vd < 0  # climb (negative D velocity) to 10 m
+    tgt = TargetEstimate(valid=True, n=5.0, e=0.0, vn=0.0, ve=0.0)
+    assert follow_velocity(0, 0, -10, 0, tgt, FO).vn < 0  # too close: back away
+    tgt = TargetEstimate(valid=True, n=12.0, e=0.0, vn=0.0, ve=1.0)
+    close(follow_velocity(0, 0, -10, 0, tgt, FO).ve, FO.ff_gain * 1.0)  # feed-forward
+
+
+def test_rate_limit_yaw_wraps() -> None:
+    close(rate_limit_yaw(170.0, -170.0, 30.0, 0.5), -175.0)
+    close(rate_limit_yaw(0.0, 90.0, 30.0, 1.0), 30.0)
 
 
 class FakeActuator:

@@ -33,8 +33,8 @@ from dimos.msgs.geometry_msgs.Vector3 import Vector3
 from dimos.msgs.nav_msgs.Odometry import Odometry
 from dimos.msgs.px4_msgs.VehicleStatus import VehicleStatus
 from dimos.msgs.sensor_msgs.Image import Image, ImageFormat
+from dimos.robot.px4.perception.bridge import PerceptionBridge
 from dimos.robot.px4.perception.tracker import MIN_HITS
-from dimos.robot.px4.perception_bridge import PerceptionBridge
 
 T0 = 1_700_000_000.0
 W, H = 320, 180
@@ -45,7 +45,7 @@ GIMBAL_PITCH_DEG = -20.0
 
 @pytest.fixture
 def bridge() -> Iterator[tuple[PerceptionBridge, dict[str, list[Any]]]]:
-    b = PerceptionBridge(detector="blob", legacy_udp_fanout=False)
+    b = PerceptionBridge(detector="blob")
     b._detector = b.make_detector()
     published: dict[str, list[Any]] = {
         "tracks": [],

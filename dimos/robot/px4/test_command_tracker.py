@@ -30,7 +30,7 @@ from dimos.msgs.nav_msgs.Odometry import Odometry
 from dimos.msgs.px4_msgs.CommandEvent import CommandEvent
 from dimos.msgs.px4_msgs.VehicleStatus import VehicleStatus
 from dimos.robot.px4.command_tracker import CommandTracker
-from dimos.robot.px4.px4_modes import LANDED_IN_AIR, LANDED_ON_GROUND, MAIN_OFFBOARD, MAIN_POSCTL
+from dimos.robot.px4.mavlink import LANDED_IN_AIR, LANDED_ON_GROUND, MAIN_OFFBOARD, MAIN_POSCTL
 from dimos.robot.px4.supervisor_core import Rejection
 
 T0 = 1_700_000_000.0
@@ -125,6 +125,29 @@ def test_rejected_command_carries_the_enum_value(
     assert tc["mux_ms"] == pytest.approx(10.0)
     assert tc["onboard_ms"] is None and tc["response_ms"] is None
     assert tracker.summary()["rejections"][reason.value] == 1
+
+
+def test_takeoff_is_scored_on_the_climb_not_the_teleop_window(tracker: CommandTracker) -> None:
+    # On the ground, disarmed: exactly what a takeoff looks like when it is requested.
+    tracker._on_vehicle_status(_vehicle(armed=False, landed=LANDED_ON_GROUND, mode=MAIN_POSCTL))
+    tracker._on_command_event(_event(command="takeoff", argument=""), now=T0 + 0.011)
+    tracker._on_offboard_setpoint(_odom(T0 + 0.05))  # position setpoints, prestream
+    tracker.sweep(now=T0 + 3.0)  # past the teleop window: still open, no verdict yet
+    assert tracker.recent() == []
+    tracker._on_odometry(_odom(T0 + 3.5, vz=0.7))  # the climb
+    tracker.sweep(now=T0 + 3.6)
+    (tc,) = tracker.recent()
+    assert tc["command"] == "takeoff" and tc["verdict"] == "ok"
+    assert tc["response_ms"] == pytest.approx(3450.0)
+
+
+def test_takeoff_that_never_climbs_is_no_motion(tracker: CommandTracker) -> None:
+    tracker._on_vehicle_status(_vehicle(armed=False, landed=LANDED_ON_GROUND, mode=MAIN_POSCTL))
+    tracker._on_command_event(_event(command="takeoff", argument=""), now=T0 + 0.011)
+    tracker._on_offboard_setpoint(_odom(T0 + 0.05))
+    tracker.sweep(now=T0 + 16.0)
+    (tc,) = tracker.recent()
+    assert tc["verdict"] == "no_motion"
 
 
 def test_accepted_teleop_completes_with_three_segments(tracker: CommandTracker) -> None:

@@ -58,7 +58,7 @@ from dimos.msgs.px4_msgs.TrackedCommand import SCORING_VERSION, TrackedCommand
 from dimos.msgs.px4_msgs.VehicleStatus import VehicleStatus
 from dimos.msgs.std_msgs.Float32 import Float32
 from dimos.msgs.std_msgs.String import String
-from dimos.robot.px4.px4_modes import LANDED_IN_AIR, LANDED_TAKEOFF, MAIN_OFFBOARD
+from dimos.robot.px4.mavlink import LANDED_IN_AIR, LANDED_TAKEOFF, MAIN_OFFBOARD
 from dimos.robot.px4.supervisor_core import Rejection
 from dimos.utils.logging_config import setup_logger
 
@@ -80,8 +80,11 @@ class CommandTrackerConfig(ModuleConfig):
     # response_min_mps, before the command counts as taken effect.
     response_frac: float = Field(default=0.3)
     response_min_mps: float = Field(default=0.15)
-    # How long after the first setpoint the airframe gets to respond.
+    # How long after the first setpoint the airframe gets to respond. Takeoff streams
+    # setpoints for prestream_s, then waits for the OFFBOARD and arm acks before it climbs,
+    # so it gets its own window.
     response_timeout_s: float = Field(default=1.5)
+    takeoff_response_timeout_s: float = Field(default=15.0)
     # How long after the verdict a setpoint must appear.
     setpoint_timeout_s: float = Field(default=1.0)
     # A teleop key held longer than this closes as "held" rather than waiting forever.
@@ -319,15 +322,23 @@ class CommandTracker(Module):
             return "ok"
         if math.isnan(o.commanded_ts):
             return "no_setpoint" if wall - o.verdict_wall > cfg.setpoint_timeout_s else None
-        if wall - o.commanded_ts > cfg.response_timeout_s:
+        takeoff = ev.command == "takeoff"
+        timeout = cfg.takeoff_response_timeout_s if takeoff else cfg.response_timeout_s
+        if wall - o.commanded_ts > timeout:
             v = o.vehicle
             airborne = v.landed_state in (-1, LANDED_IN_AIR, LANDED_TAKEOFF)
-            if not v.armed or not airborne:
+            # A takeoff starts disarmed on the ground by definition; only teleop is judged
+            # on the vehicle state at the time of the command.
+            if not takeoff and (not v.armed or not airborne):
                 return "not_expected_to_move"
-            if v.main_mode != MAIN_OFFBOARD:
+            if not takeoff and v.main_mode != MAIN_OFFBOARD:
                 return "mode_not_offboard"
             return "no_motion"
-        if math.isnan(o.closed_ts) and wall - o.verdict_wall > cfg.event_max_s:
+        if (
+            ev.command == "cmd_vel"
+            and math.isnan(o.closed_ts)
+            and wall - o.verdict_wall > cfg.event_max_s
+        ):
             return "held"
         return None
 

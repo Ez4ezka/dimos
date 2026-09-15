@@ -12,13 +12,85 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""The MAVLink layer without a socket: frames, timebase, vehicle state and timed buffers."""
+
 from __future__ import annotations
 
 import math
 from typing import Any
 
-from dimos.robot.px4.mavlink.vehicle_state import TimedBuffer, VehicleState
-from dimos.robot.px4.px4_modes import MAIN_OFFBOARD
+import pytest
+
+from dimos.msgs.geometry_msgs.Quaternion import Quaternion
+from dimos.msgs.geometry_msgs.Vector3 import Vector3
+from dimos.robot.px4.mavlink import (
+    MAIN_OFFBOARD,
+    Px4Timebase,
+    TimedBuffer,
+    VehicleState,
+    body_flu_velocity_to_ned,
+    flu_to_ned,
+    frd_to_flu,
+    ned_to_flu,
+    quaternion_from_ned_euler,
+)
+
+_UNIX = 1_800_000_000.0
+
+
+def test_ned_to_flu_matches_upstream_signs() -> None:
+    # Same convention as dimos/robot/drone/test_drone.py::test_ned_to_ros_coordinate_conversion:
+    # north -> +x, east -> -y, down -> -z.
+    assert ned_to_flu(3.0, 4.0, -1.0) == (3.0, -4.0, 1.0)
+    assert flu_to_ned(*ned_to_flu(3.0, 4.0, -1.0)) == (3.0, 4.0, -1.0)
+    assert frd_to_flu(1.0, 2.0, 9.8) == (1.0, -2.0, -9.8)
+
+
+def test_quaternion_matches_mavlink_connection_conversion() -> None:
+    # mavlink_connection.py:170: Quaternion.from_euler(Vector3(roll, -pitch, -yaw))
+    q = quaternion_from_ned_euler(0.1, 0.2, 0.3)
+    ref = Quaternion.from_euler(Vector3(0.1, -0.2, -0.3))
+    assert (q.x, q.y, q.z, q.w) == pytest.approx((ref.x, ref.y, ref.z, ref.w))
+
+
+def test_body_velocity_rotates_with_heading() -> None:
+    # Heading north: forward is north, left is west (negative east).
+    assert body_flu_velocity_to_ned(1.0, 0.5, 0.2, 0.0) == pytest.approx((1.0, -0.5, -0.2))
+    # Heading east (yaw +90 deg clockwise): forward is east, left is north.
+    vn, ve, vd = body_flu_velocity_to_ned(1.0, 0.5, 0.0, math.radians(90))
+    assert (vn, ve, vd) == pytest.approx((0.5, 1.0, 0.0), abs=1e-12)
+
+
+def test_median_offset_and_jump_guard() -> None:
+    tb = Px4Timebase(min_samples=3, jump_guard_s=0.5)
+    assert tb.quality == "none"
+    with pytest.raises(RuntimeError):
+        tb.to_utc(0.0)
+    for boot in (10.0, 11.0, 12.0):
+        tb.add_system_time(_UNIX + boot, boot, receive_wall_s=_UNIX + boot + 0.02)
+    assert tb.quality == "system_time"
+    assert tb.offset_s == _UNIX
+    # A wild sample is rejected, not averaged in.
+    tb.add_system_time(_UNIX + 13.0 + 5.0, 13.0, receive_wall_s=_UNIX + 13.02)
+    assert tb.rejected == 1
+    assert tb.offset_s == _UNIX
+    assert tb.to_utc(20.0) == _UNIX + 20.0
+
+
+def test_partial_quality_below_min_samples() -> None:
+    tb = Px4Timebase(min_samples=30)
+    tb.add_system_time(_UNIX + 1.0, 1.0, receive_wall_s=_UNIX + 1.01)
+    assert tb.quality == "system_time_partial"
+    assert tb.offset_s == _UNIX
+
+
+def test_receive_time_fallback_is_min_filtered() -> None:
+    tb = Px4Timebase(min_samples=3)
+    # No GPS: PX4 reports unix time 0. Latency varies 10..50 ms; min wins.
+    for boot, latency in ((1.0, 0.05), (2.0, 0.01), (3.0, 0.03)):
+        tb.add_system_time(0.0, boot, receive_wall_s=_UNIX + boot + latency)
+    assert tb.quality == "receive_time"
+    assert tb.offset_s == pytest.approx(_UNIX + 0.01)
 
 
 class Msg:
