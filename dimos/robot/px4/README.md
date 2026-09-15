@@ -66,6 +66,7 @@ dimos run px4-sitl-tracked      # px4-sitl + CommandTracker scoring every comman
 dimos run px4-bench             # aircraft, props off: + A8 video, gimbal chain, tracker
 dimos run px4-sitl-bench        # the bench stack against SITL with a replayed clip and a fake A8
 dimos run px4-field             # aircraft in the field: px4-bench + link monitor
+dimos run px4-sitl-perception   # px4-sitl with the real perception chain on a replayed clip
 ```
 
 Then, from `dimos shell`: `px4_drone_connection.sitl_enable(True)`, `.takeoff()`,
@@ -158,6 +159,36 @@ dimos run link-monitor                                   # the module alone (har
 dimos run link-monitor --linkmonitor.source=replay       # replayed scenario, no modem
 dimos run px4-field                                      # aircraft in the field: px4-bench + link monitor
 dimos run px4-sitl-field                                 # the same against SITL with a replayed link
+```
+
+## Perception bridge
+
+`perception_bridge.py` is the flown perception stack in one process: detector, the
+persistent-ID tracker, the line-of-sight solver and the target ground-position estimator
+(`perception/`), with the geometry and tracker parameters that flew. It consumes
+RtspCamera's `color_image` plus the connection's `odometry`, `gimbal_attitude`,
+`global_pose` and `vehicle_status`, and publishes the exact three streams the connection
+reads for FOLLOW and YAW_TRACK, `target_state`, `target_valid` and `target_los`, so it is
+interchangeable with `FakeTarget` in a blueprint. It also publishes `tracks`
+(Detection2DArray, selected track first) for the viewer.
+
+Operator click-to-select arrives on `track_select` as a pixel in the published frame; a
+NaN point clears the selection. The selection persists while the track is lost. The four
+flown scripts talked over UDP because they were processes; in one process the inbound
+fan-out ports are gone, and the outbound JSON the flown gimbal controller (5608) and the
+laptop viewer (5605, 5613) read is still emitted behind `legacy_udp_fanout`.
+
+Detectors: `ultralytics` runs a YOLO `.pt` anywhere, or the same TensorRT `.engine` the
+flown `yolo_live_trackfeed.py` built on the Jetson. `blob` is the test double: it finds the
+synthetic clip's bright square by thresholding, so the tracker, line of sight and ground
+intersection run on real pixels without a GPU. A recorded walking-person capture from the
+bench replaces the synthetic clip in the gate when it exists.
+
+```bash
+uv run pytest dimos/robot/px4/perception dimos/robot/px4/test_perception_bridge.py
+uv run python dimos/robot/px4/tool_perception_gate.py    # PX4 SITL + replayed clip + fake A8
+dimos run px4-sitl-perception --rtspcamera.url=clip.mp4  # px4-sitl with the chain instead of FakeTarget
+dimos run perception-bridge                              # the module alone
 ```
 
 ## Safety invariants

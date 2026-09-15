@@ -29,9 +29,9 @@ import numpy as np
 SQUARE = 24
 
 
-def square_origin(index: int, width: int, height: int) -> tuple[int, int]:
-    """Top-left corner of the white square in frame ``index``."""
-    x = (index * 8) % max(1, width - SQUARE)
+def square_origin(index: int, width: int, height: int, centered: bool = False) -> tuple[int, int]:
+    """Top-left corner of the white square in frame ``index`` (walking, or parked at centre)."""
+    x = width // 2 - SQUARE // 2 if centered else (index * 8) % max(1, width - SQUARE)
     y = height // 2 - SQUARE // 2
     return x, y
 
@@ -43,6 +43,7 @@ def write_synthetic_h265(
     height: int = 180,
     fps: int = 25,
     seconds: float = 2.0,
+    centered: bool = False,
 ) -> int:
     """Encode the clip with libx265 to ``path`` (.mp4). Returns the frame count."""
     n = round(fps * seconds)
@@ -55,7 +56,7 @@ def write_synthetic_h265(
         stream.options = {"preset": "ultrafast", "x265-params": "log-level=none", "crf": "20"}
         for i in range(n):
             img = np.full((height, width, 3), 96, dtype=np.uint8)
-            x, y = square_origin(i, width, height)
+            x, y = square_origin(i, width, height, centered)
             img[y : y + SQUARE, x : x + SQUARE] = 255
             frame = av.VideoFrame.from_ndarray(img, format="rgb24")
             frame.pts = i

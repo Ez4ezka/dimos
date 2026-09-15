@@ -43,6 +43,9 @@ class FakeA8Config(ModuleConfig):
     # The real A8 slews about 90 deg/s.
     slew_dps: float = Field(default=90.0)
     frame_id: str = Field(default="gimbal_base")
+    # Where the fake gimbal points before any request arrives (degrees).
+    initial_pitch_deg: float = Field(default=0.0)
+    initial_yaw_deg: float = Field(default=0.0)
 
 
 class FakeA8(Module):
@@ -54,9 +57,9 @@ class FakeA8(Module):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._lock = threading.Lock()
-        self._pitch = 0.0
-        self._yaw = 0.0
-        self._target = (0.0, 0.0)
+        self._pitch = self.config.initial_pitch_deg
+        self._yaw = self.config.initial_yaw_deg
+        self._target = (self._pitch, self._yaw)
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
