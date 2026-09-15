@@ -63,6 +63,8 @@ dimos run px4-sitl              # same against PX4 SITL (`make px4_sitl gz_x500`
 dimos run px4-sitl-follow       # + a scripted target for FOLLOW and YAW_TRACK
 dimos run px4-drone-connection  # the connection alone, no viewer
 dimos run px4-sitl-tracked      # px4-sitl + CommandTracker scoring every command
+dimos run px4-bench             # aircraft, props off: + A8 video, gimbal chain, tracker
+dimos run px4-sitl-bench        # the bench stack against SITL with a replayed clip and a fake A8
 ```
 
 Then, from `dimos shell`: `px4_drone_connection.sitl_enable(True)`, `.takeoff()`,
@@ -73,6 +75,7 @@ Then, from `dimos shell`: `px4_drone_connection.sitl_enable(True)`, `.takeoff()`
 ```bash
 uv run pytest dimos/robot/px4 dimos/msgs/px4_msgs        # no hardware, no simulator
 uv run python dimos/robot/px4/tool_sitl_gate.py --fly    # PX4 SITL: takeoff, hover, land
+uv run python dimos/robot/px4/tool_bench_gate.py         # PX4 SITL: gimbal tf chain, frame stamps, aim
 uv run mypy dimos/robot/px4 && uv run ruff check dimos/robot/px4
 ```
 

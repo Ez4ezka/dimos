@@ -149,6 +149,9 @@ class Px4DroneConnectionConfig(ModuleConfig):
     gimbal_mount_xyz: tuple[float, float, float] = Field(default=PX4_HARDWARE.gimbal_mount_xyz)
     # "flight" = A8 hanging under the frame (verified 2026-09-04); "bench" = base down.
     gimbal_mount_preset: Literal["flight", "bench"] = Field(default="flight")
+    # The static base_link -> gimbal_base edge rides on every tf tick here, unless the
+    # SiyiA8Gimbal module runs and publishes the whole gimbal chain itself.
+    publish_gimbal_mount_tf: bool = Field(default=True)
     odom_hz: float = Field(default=PX4_HARDWARE.odom_hz)
     imu_hz: float = Field(default=PX4_HARDWARE.imu_hz)
     motor_outputs_hz: float = Field(default=PX4_HARDWARE.motor_outputs_hz)
@@ -297,7 +300,7 @@ class Px4DroneConnection(Module):
         self._io.start()
         self._io.wait_for_px4(cfg.connect_timeout_s)
         self._io.send_heartbeat()
-        if cfg.gimbal_mount_xyz == GIMBAL_MOUNT_XYZ_UNMEASURED:
+        if cfg.publish_gimbal_mount_tf and cfg.gimbal_mount_xyz == GIMBAL_MOUNT_XYZ_UNMEASURED:
             logger.warning(
                 "gimbal_mount_xyz is the UNMEASURED placeholder; the tf gimbal edge is a guess"
             )
@@ -684,17 +687,17 @@ class Px4DroneConnection(Module):
             )
         )
         # Both edges at the odom stamp so consumers never see one without the other.
-        self.tf.publish(
-            TFMessage(
-                Transform.from_pose(cfg.base_frame_id, pose),
+        edges = [Transform.from_pose(cfg.base_frame_id, pose)]
+        if cfg.publish_gimbal_mount_tf:
+            edges.append(
                 Transform(
                     translation=Vector3(*cfg.gimbal_mount_xyz),
                     frame_id=cfg.base_frame_id,
                     child_frame_id=cfg.gimbal_base_frame_id,
                     ts=ts,
-                ),
+                )
             )
-        )
+        self.tf.publish(TFMessage(*edges))
 
     def _publish_imu(self, state: VehicleState) -> None:
         with state.lock:
