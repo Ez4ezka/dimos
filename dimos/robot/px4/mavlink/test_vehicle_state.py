@@ -17,8 +17,8 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from dimos.robot.px4.mavlink.px4_modes import MAIN_OFFBOARD
 from dimos.robot.px4.mavlink.vehicle_state import TimedBuffer, VehicleState
+from dimos.robot.px4.px4_modes import MAIN_OFFBOARD
 
 
 class Msg:

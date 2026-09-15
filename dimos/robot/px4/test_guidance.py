@@ -18,10 +18,9 @@ from __future__ import annotations
 
 import math
 
+from dimos.robot.px4.config import FollowConfig, YawTrackConfig
 from dimos.robot.px4.guidance import (
-    FollowConfig,
     TargetEstimate,
-    YawTrackConfig,
     follow_velocity,
     rate_limit_yaw,
     yaw_track_rate,

@@ -19,7 +19,7 @@ FOLLOW: hold a standoff distance and altitude to the estimated target with veloc
 feed-forward. Neither ever commands from raw pixel error.
 
 Ported from drone-autonomy ``common/guidance.py`` (flown 2026-09-09). The maths is
-byte-identical; only the config dicts became dataclasses.
+byte-identical; the config dicts became the dataclasses in ``config.py``.
 """
 
 from __future__ import annotations
@@ -27,32 +27,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
+from dimos.robot.px4.config import FollowConfig, YawTrackConfig
 from dimos.utils.angles import clamp, wrap180
-
-
-@dataclass(frozen=True)
-class YawTrackConfig:
-    """``config/follow.json`` ``guidance.yaw_track``."""
-
-    deadband_deg: float = 15.0
-    k_yaw: float = 0.6
-    max_yaw_rate_dps: float = 30.0
-
-
-@dataclass(frozen=True)
-class FollowConfig:
-    """``config/follow.json`` ``guidance.follow``."""
-
-    standoff_m: float = 12.0
-    altitude_m: float = 10.0
-    k_range: float = 0.4
-    k_alt: float = 0.6
-    v_max_mps: float = 2.0
-    vz_max_mps: float = 0.7
-    ff_gain: float = 0.8
-    range_deadband_m: float = 1.5
-    loss_hold_s: float = 1.0
-    loss_hover_s: float = 5.0
 
 
 @dataclass

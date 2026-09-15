@@ -20,7 +20,7 @@ import pytest
 
 from dimos.msgs.geometry_msgs.Quaternion import Quaternion
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
-from dimos.robot.px4.mavlink.frames import (
+from dimos.robot.px4.frames import (
     body_flu_velocity_to_ned,
     flu_to_ned,
     frd_to_flu,

@@ -41,18 +41,27 @@ from dimos.hardware.gimbal.siyi.frame import (
     normalize_attitude,
     quat_to_euler_deg,
 )
-from dimos.robot.px4.mavlink.px4_modes import (
+from dimos.robot.px4.config import A8_COMPID, PX4_COMPID, PX4_SYSID
+from dimos.robot.px4.px4_modes import (
     MAIN_OFFBOARD,
     MAV_MODE_FLAG_SAFETY_ARMED,
     decode_custom_mode,
 )
 from dimos.utils.angles import wrap180
 
-PX4_SYSID = 1
-PX4_COMPID = 1
-A8_COMPID = 154
-
 _UINT16_INVALID = 65535
+_STATUSTEXT_KEEP = 64
+# MAV_SEVERITY names, index = severity value.
+STATUSTEXT_SEVERITY = (
+    "EMERGENCY",
+    "ALERT",
+    "CRITICAL",
+    "ERROR",
+    "WARNING",
+    "NOTICE",
+    "INFO",
+    "DEBUG",
+)
 
 
 def is_from_px4(msg: Any) -> bool:
@@ -226,6 +235,29 @@ class SystemTime:
 
 
 @dataclass(frozen=True)
+class ServoOutputs:
+    """SERVO_OUTPUT_RAW: what PX4 drove each output to, in PWM microseconds."""
+
+    pwm: tuple[int, ...]
+    boot_s: float | None
+    t: float
+
+
+@dataclass(frozen=True)
+class StatusText:
+    seq: int
+    severity: int
+    text: str
+    t: float
+
+    @property
+    def severity_name(self) -> str:
+        if 0 <= self.severity < len(STATUSTEXT_SEVERITY):
+            return STATUSTEXT_SEVERITY[self.severity]
+        return str(self.severity)
+
+
+@dataclass(frozen=True)
 class VehicleSnapshot:
     """What the supervisor core sees each tick. Ages are wall-clock seconds at snapshot time."""
 
@@ -280,6 +312,10 @@ class VehicleState:
         self.rc: RcChannels | None = None
         self.imu: ImuSample | None = None
         self.system_time: SystemTime | None = None
+        self.servo_outputs: ServoOutputs | None = None
+        # PX4's own warnings, kept until the publish loop forwards them.
+        self.statustext: deque[StatusText] = deque(maxlen=_STATUSTEXT_KEEP)
+        self._statustext_seq = 0
         self.last_px4_msg = 0.0
 
     @property
@@ -391,6 +427,25 @@ class VehicleState:
         elif name == "SYSTEM_TIME":
             self.system_time = SystemTime(
                 unix_s=msg.time_unix_usec / 1e6, boot_s=msg.time_boot_ms / 1e3, t=t
+            )
+        elif name == "SERVO_OUTPUT_RAW":
+            pwm = tuple(
+                int(v)
+                for v in (getattr(msg, f"servo{i}_raw", None) for i in range(1, 17))
+                if v is not None
+            )
+            self.servo_outputs = ServoOutputs(pwm=pwm, boot_s=_boot_s(msg), t=t)
+        elif name == "STATUSTEXT":
+            self._statustext_seq += 1
+            raw = msg.text
+            text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+            self.statustext.append(
+                StatusText(
+                    seq=self._statustext_seq,
+                    severity=int(msg.severity),
+                    text=text.rstrip("\0"),
+                    t=t,
+                )
             )
 
     def age(self, item: Any) -> float:

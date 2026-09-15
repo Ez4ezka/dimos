@@ -39,7 +39,7 @@ from dimos.msgs.geometry_msgs.Quaternion import Quaternion
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
 from dimos.msgs.nav_msgs.Odometry import Odometry
-from dimos.robot.px4.mavlink.frames import ned_to_flu
+from dimos.robot.px4.frames import ned_to_flu
 
 
 class FakeTargetConfig(ModuleConfig):

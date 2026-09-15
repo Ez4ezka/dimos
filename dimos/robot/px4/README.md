@@ -1,69 +1,132 @@
 # PX4 drone (dimosdrone-2)
 
-Holybro X500, Pixhawk 6C on PX4 v1.17.0 (custom CRSF build), Jetson Orin Nano
+Holybro X500 on a Pixhawk 6C running PX4 v1.17.0 (custom CRSF build), Jetson Orin Nano
 companion (JetPack 6), SIYI A8 mini gimbal camera on a hanging mount, RTK GNSS, ELRS
-from a RadioMaster TX16S, Quectel RM520N-GL 5G modem. Everything flight-critical runs
-on the Jetson; the operator link is never in the control loop.
+from a RadioMaster TX16S, Quectel RM520N-GL 5G modem. Everything flight-critical runs on
+the Jetson; the operator link is never in the control loop.
 
-This package ports the bespoke stack that flew on 2026-09-09 (`~/drone-autonomy`)
-into dimOS modules. The flight logic is byte-for-byte the flown code; only the
-plumbing changed.
+This package ports the bespoke stack that flew on 2026-09-09 (`~/drone-autonomy`) into
+dimOS modules. The flight logic is the flown code; only the plumbing changed.
 
-## Modules
+## Aircraft-side setup
 
-| Module | File | Role |
-|---|---|---|
-| `Px4Drone` | `px4_drone.py` | The MAVLink connection and the Offboard flight supervisor in one process. Publishes odometry, IMU, GPS, battery, RC, gimbal attitude and status; runs the takeoff / hover / yaw-track / follow / teleop / land state machine at 20 Hz. |
-| `FakeTarget` | `sitl/fake_target.py` | Scripted target (line, circle, drop windows) for SITL FOLLOW and YAW_TRACK tests. |
+Everything in this section runs **on the Jetson**, over ssh (`ezendimos@100.110.224.46`),
+not on your workstation.
 
-Inside `Px4Drone` the classes stay separate: `mavlink/io.py` owns the socket and the
-reader thread, `mavlink/vehicle_state.py` keeps the timed telemetry buffers,
-`mavlink/timebase.py` converts vehicle boot time to UTC, `supervisor_core.py` is the
-pure state machine (no socket, no port, no pymavlink) and `guidance.py` holds the
-yaw-track and follow maths.
+`mavlink-routerd` owns the Pixhawk UART (`/dev/ttyTHS1`, 921600) and fans out one UDP
+endpoint per service. Add the dimOS endpoint next to the existing ones in
+`/etc/mavlink-router/main.conf` (or `~/autonomy/config/mavlink-router.conf` if the router
+is still started by hand), then restart the router:
 
-## Safety invariants
-
-1. The RC pilot always wins. If PX4 is not in OFFBOARD the software stands down
-   silently and sends no mode command. Pilot escape: flight-mode switch to Position or
-   Hold, or any stick past `COM_RC_STICK_OV`.
-2. Exactly one thing produces Offboard setpoints: the `Px4Drone` tick thread, through
-   `MavlinkIO`. There is no arm, mode or setpoint RPC (`test_px4_drone.py` asserts it).
-3. If the tick stops, the stream stops and PX4's Offboard-loss failsafe (`COM_OBL_RC_ACT`,
-   `COM_OF_LOSS_T`) puts the aircraft in Hold. Never add a fallback that keeps commanding.
-4. E-STOP is Hold plus a latch. Nothing moves the aircraft until `estop_clear`, which
-   only works in IDLE.
-5. `Px4Drone` refuses to start while the flown `flight_supervisor.py` holds its UDP
-   port (5610), so two writers can never coexist.
-
-## Running
-
-```bash
-# SITL on the laptop: PX4 v1.16 tree, `make px4_sitl gz_x500` in another terminal.
-dimos run px4-sitl
-dimos run px4-sitl-follow      # adds a scripted target
-dimos shell                    # then: px4_drone.sitl_enable(True); px4_drone.takeoff()
+```ini
+[UdpEndpoint dimos]
+Mode = Normal
+Address = 127.0.0.1
+Port = 14556
 ```
 
-On the Jetson `mavlink-routerd` owns the UART (`/dev/ttyTHS1`, 921600) and fans out
-one UDP endpoint per service. Add `14556` for this module (component 195) next to the
-existing 14550 gimbal (191), 14551 line-of-sight (192), 14552 old supervisor (193),
-14553 logger, 14554 QGroundControl throttle. Do not reuse any of those.
+The full endpoint table is `ROUTER_ENDPOINTS` in `config.py`: 14550 gimbal controller
+(component 191), 14551 line of sight (192), 14552 the flown supervisor (193), 14553 logger,
+14554 QGroundControl throttle, 14556 this package (195). Never reuse another service's port.
 
-PX4 parameters for companion Offboard flight (set in QGroundControl, then reboot):
+PX4 parameters for companion Offboard flight, set in QGroundControl then reboot:
 `COM_OBL_RC_ACT=5` (Hold on setpoint loss), `COM_OF_LOSS_T=0.5`, `COM_RC_OVERRIDE=3`,
 `NAV_RCL_ACT=2`, `COM_RC_LOSS_T=0.5`, `GF_ACTION=2`, `GF_MAX_HOR_DIST=50`,
 `GF_MAX_VER_DIST=30`, `COM_DISARM_LAND=2`, `MPC_XY_VEL_MAX=3`, `MPC_Z_VEL_MAX_UP=1.5`,
-`MPC_Z_VEL_MAX_DN=1.0`, `COM_ARM_WO_GPS=0`, `COM_HOME_EN=1`. These were not yet set on
-the vehicle as of 2026-09-09; verify the failsafe parameter names against v1.17 first.
+`MPC_Z_VEL_MAX_DN=1.0`, `COM_ARM_WO_GPS=0`, `COM_HOME_EN=1`. Not yet set on the vehicle as
+of 2026-09-09; verify the failsafe parameter names against v1.17 first. Keep the existing
+`MAV_1_CONFIG=102 MAV_1_MODE=2 MAV_1_FORWARD=1 SER_TEL2_BAUD=921600`, the `MAV_2_*` set
+for the A8, and `MNT_MODE_IN=4 MNT_MODE_OUT=2`.
+
+The flown `flight_supervisor.py` and `Px4DroneConnection` must never run together.
+The connection holds the supervisor's UDP port 5610 as a lock and refuses to start
+while it is taken.
+
+## Environment
+
+- Install with the `px4` extra (pymavlink, PyAV, pyserial):
+  `uv sync --extra px4` or, for everything, `uv sync --extra all`.
+- On the Jetson use the system Python 3.10 the way the R1 Pro README describes
+  (`uv sync --python /usr/bin/python3.10 --python-preference only-system --extra px4`).
+  The TensorRT detector for the perception bridge only exists there.
+- PX4 SITL on a workstation: the PX4 v1.16 tree with `make px4_sitl gz_x500`. PX4 refuses
+  to arm without a ground station; `tool_sitl_gate.py` runs a stand-in heartbeat on 14550,
+  and in the field that role is QGroundControl.
+- The gimbal mount offset (`gimbal_mount_xyz`) is an UNMEASURED placeholder and the
+  connection warns at start until a measured value replaces it.
+
+## Blueprints
+
+```bash
+dimos run px4-basic             # connection + viewer, on the Jetson against endpoint 14556
+dimos run px4-sitl              # same against PX4 SITL (`make px4_sitl gz_x500`)
+dimos run px4-sitl-follow       # + a scripted target for FOLLOW and YAW_TRACK
+dimos run px4-drone-connection  # the connection alone, no viewer
+```
+
+Then, from `dimos shell`: `px4_drone_connection.sitl_enable(True)`, `.takeoff()`,
+`.set_guidance_mode("FOLLOW")`, `.land()`, `.estop()`, `.status()`, `.sensor_stats()`.
+
+## Tests and gates
+
+```bash
+uv run pytest dimos/robot/px4 dimos/msgs/px4_msgs        # no hardware, no simulator
+uv run python dimos/robot/px4/tool_sitl_gate.py --fly    # PX4 SITL: takeoff, hover, land
+uv run mypy dimos/robot/px4 && uv run ruff check dimos/robot/px4
+```
+
+## Port contract
+
+Fixed after Round 1; new modules bind by exact name and type. Topics are `dimos/<port>`.
+
+| Direction | Port | Type | Rate |
+|---|---|---|---|
+| out | odometry, odom, tf | Odometry, PoseStamped, TFMessage | 30 Hz, latest-wins |
+| out | imu | Imu | 50 Hz, latest-wins |
+| out | motor_outputs | JointState (PWM us) | on change, up to 10 Hz |
+| out | gps, global_pose | NavSatFix, PoseStamped (frame `home`) | 5 Hz |
+| out | battery | BatteryState | 1 Hz |
+| out | rc | Joy (raw microseconds) | 5 Hz |
+| out | gimbal_attitude | JointState (radians, flags in effort) | 10 Hz, latest-wins |
+| out | vehicle_status | VehicleStatus | 5 Hz |
+| out | statustext | String, PX4's own messages | as they arrive |
+| out | supervisor_status | String, the flown JSON, transitional | 5 Hz |
+| out | supervisor_state | String | on change |
+| out | command_event | CommandEvent | per operator command |
+| out | offboard_setpoint | Odometry, stamped at the write | 20 Hz |
+| out | robot_state | bytes, hosted UI plane | 2 Hz |
+| out | stop_movement | Bool | event |
+| in | cmd_vel | Twist, body FLU, honoured only in TELEOP | 20 Hz |
+| in | gimbal_target | JointState (`gimbal_pitch`, `gimbal_yaw`) | up to 10 Hz |
+| in | target_state, target_valid, target_los | Odometry, Bool, PoseStamped | 25 Hz |
+| in | estop_in | Bool | event |
+
+RPCs: `takeoff`, `land`, `hold`, `set_guidance_mode`, `estop`, `estop_land`,
+`estop_clear`, `status`, `snapshot`, `sensor_stats`, `sitl_enable`. There is no arm, mode
+or setpoint RPC, and `test_connection.py` asserts it.
+
+## Safety invariants
+
+1. The RC pilot always wins. If PX4 is not in OFFBOARD the software stands down silently
+   and sends no mode command. Pilot escape: flight-mode switch to Position or Hold, or any
+   stick past `COM_RC_STICK_OV`.
+2. Exactly one thing produces Offboard setpoints: the connection's tick thread through
+   `MavlinkIO`.
+3. If the tick stops, the stream stops and PX4's Offboard-loss failsafe puts the aircraft
+   in Hold. Never add a fallback that keeps commanding.
+4. E-STOP is Hold plus a latch. Nothing moves the aircraft until `estop_clear`, which only
+   works in IDLE.
+5. Gimbal aim commands go through the connection (`gimbal_target`) and only when
+   `gimbal_commands_enabled` is set; until then the flown controller on component 191
+   keeps control of the A8.
 
 ## Flight gates
 
-Each must pass before the next, props off first, then a pilot present.
+Each must pass before the next, props off first, then with a pilot present.
 
-1. Bench, props off: `takeoff` with the enable switch (channel 7) off stays in
-   PREFLIGHT with reason `enable switch off`, returns to IDLE after 10 s, sends zero
-   setpoints and no arm command.
+1. Bench, props off: `takeoff` with the enable switch (channel 7) off stays in PREFLIGHT
+   with reason `enable switch off`, returns to IDLE after 10 s, sends zero setpoints and
+   no arm command.
 2. Pilot Position-mode hover, gimbal tracking only.
 3. `takeoff` to 3 m hover, `land`. Check altitude error, setpoint rate, no ABORT.
 4. `set_guidance_mode("YAW_TRACK")`: the airframe yaws to keep the gimbal within 15 deg.
@@ -71,15 +134,13 @@ Each must pass before the next, props off first, then a pilot present.
 
 ## Frames and conventions
 
-dimOS is FLU (x forward/north, y left/west, z up). MAVLink LOCAL_NED is converted with
-`mavlink/frames.py`, the same signs as `dimos/robot/drone/mavlink_connection.py`. The
-gimbal reports body-relative yaw and earth-stabilised pitch (verified 2026-09-04);
-`gimbal_attitude` carries radians in `position` and the MAVLink flag bits in `effort`.
-`rc` carries raw microseconds in `axes` so the 1500 us enable threshold keeps meaning.
-`offboard_setpoint` is stamped when the datagram left the process, not when published.
+dimOS is FLU (x forward/north, y left/west, z up). MAVLink LOCAL_NED is converted in
+`frames.py` with the same signs as `dimos/robot/drone/mavlink_connection.py`. The gimbal
+reports body-relative yaw and earth-stabilised pitch (verified 2026-09-04). Vehicle boot
+time becomes UTC through `mavlink/timebase.py` from SYSTEM_TIME.
 
 ## Network reality (measured 2026-09-09)
 
-Wi-Fi direct 7 ms. Both ends on cellular through the Tailscale relay: 86 ms average
-with throttled telemetry, 413 ms and 5 % loss with raw telemetry, and no headroom for
-video on that cell. Nothing flight-critical crosses the link.
+Wi-Fi direct 7 ms. Both ends on cellular through the Tailscale relay: 86 ms average with
+throttled telemetry, 413 ms and 5 % loss with raw telemetry, and no headroom for video on
+that cell. Nothing flight-critical crosses the link.

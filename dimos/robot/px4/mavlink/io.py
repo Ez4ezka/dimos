@@ -39,9 +39,10 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
-from dimos.robot.px4.mavlink.px4_modes import MASK_POS_YAW, MASK_VEL_YAW, MASK_VEL_YAWRATE
+from dimos.robot.px4.config import A8_COMPID, PX4_COMPID, PX4_SYSID
 from dimos.robot.px4.mavlink.timebase import Px4Timebase
-from dimos.robot.px4.mavlink.vehicle_state import PX4_COMPID, PX4_SYSID, VehicleState, is_from_px4
+from dimos.robot.px4.mavlink.vehicle_state import VehicleState, is_from_px4
+from dimos.robot.px4.px4_modes import MASK_POS_YAW, MASK_VEL_YAW, MASK_VEL_YAWRATE
 from dimos.utils.logging_config import setup_logger
 
 if TYPE_CHECKING:
@@ -54,6 +55,8 @@ MSG_ID_SYSTEM_TIME = 2
 MAV_CMD_SET_MESSAGE_INTERVAL = 511
 MAV_CMD_COMPONENT_ARM_DISARM = 400
 MAV_CMD_DO_SET_MODE = 176
+MAV_CMD_DO_GIMBAL_MANAGER_PITCHYAW = 1000
+MAV_CMD_DO_GIMBAL_MANAGER_CONFIGURE = 1001
 MAV_MODE_FLAG_CUSTOM_MODE_ENABLED = 1
 MAV_FRAME_LOCAL_NED = 1
 MAV_RESULT_ACCEPTED = 0
@@ -272,6 +275,39 @@ class MavlinkIO:
 
     def arm(self, value: bool) -> None:
         self.send_command(MAV_CMD_COMPONENT_ARM_DISARM, 1.0 if value else 0.0)
+
+    # Gimbal manager (PX4 is the manager, the A8 is device 154). Ported from
+    # drone-autonomy common/gimbal.py:98-113, the calls the known-good keyboard controller
+    # made. Only used when the connection is configured to own gimbal control.
+
+    def claim_gimbal_control(self, gimbal_device: int = A8_COMPID) -> Future[int]:
+        """Take primary control for our own (system, component)."""
+        return self.send_command(
+            MAV_CMD_DO_GIMBAL_MANAGER_CONFIGURE,
+            float(self._source_system),
+            float(self._source_component),
+            -1.0,
+            -1.0,
+            0.0,
+            0.0,
+            float(gimbal_device),
+        )
+
+    def send_gimbal_pitchyaw(
+        self, pitch_deg: float, yaw_deg: float, gimbal_device: int = A8_COMPID
+    ) -> None:
+        """Absolute pitch/yaw in degrees, flags 0 = yaw in the body (follow) frame."""
+        nan = float("nan")
+        self.send_command(
+            MAV_CMD_DO_GIMBAL_MANAGER_PITCHYAW,
+            pitch_deg,
+            yaw_deg,
+            nan,
+            nan,
+            0.0,
+            0.0,
+            float(gimbal_device),
+        )
 
     def send_position_setpoint(self, n: float, e: float, d: float, yaw_rad: float) -> None:
         conn = self._conn

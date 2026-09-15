@@ -35,14 +35,14 @@ from dimos.core.coordination.blueprint_config.parser import BlueprintConfigParse
 from dimos.core.coordination.module_coordinator import ModuleCoordinator
 from dimos.msgs.nav_msgs.Odometry import Odometry
 from dimos.robot.px4.blueprints.basic.px4_sitl import px4_sitl
-from dimos.robot.px4.px4_drone import Px4Drone
+from dimos.robot.px4.connection import Px4DroneConnection
 
 
 def _fake_gcs(stop: threading.Event) -> None:
     """Stand in for QGroundControl on SITL's normal MAVLink instance (port 14550).
 
     PX4's arming check refuses without a ground station; in the field QGC is always
-    connected. SITL only: system 255 is exactly what Px4Drone must never be.
+    connected. SITL only: system 255 is exactly what Px4DroneConnection must never be.
     """
     from pymavlink import mavutil
 
@@ -78,7 +78,7 @@ def main() -> int:
     coordinator = ModuleCoordinator.build(px4_sitl, parsed)
     ok = True
     try:
-        drone = coordinator.get_instance(Px4Drone)
+        drone = coordinator.get_instance(Px4DroneConnection)
 
         stamps: list[tuple[float, float]] = []
         lock = threading.Lock()

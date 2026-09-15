@@ -37,22 +37,22 @@ enum, and ``set_hold``/``set_land`` gated on PX4 being in OFFBOARD (safety invar
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import enum
 import math
 import time
 from typing import Any, Literal, Protocol
 
+from dimos.robot.px4.config import GuidanceConfig, SupervisorLimits
+from dimos.robot.px4.frames import body_flu_velocity_to_ned
 from dimos.robot.px4.guidance import (
-    FollowConfig,
     TargetEstimate,
-    YawTrackConfig,
     follow_velocity,
     rate_limit_yaw,
     yaw_track_rate,
 )
-from dimos.robot.px4.mavlink.frames import body_flu_velocity_to_ned
-from dimos.robot.px4.mavlink.px4_modes import (
+from dimos.robot.px4.mavlink.vehicle_state import VehicleSnapshot
+from dimos.robot.px4.px4_modes import (
     LANDED_ON_GROUND,
     MAIN_AUTO,
     MAIN_OFFBOARD,
@@ -60,7 +60,6 @@ from dimos.robot.px4.mavlink.px4_modes import (
     SUB_AUTO_LOITER,
     mode_name,
 )
-from dimos.robot.px4.mavlink.vehicle_state import VehicleSnapshot
 from dimos.utils.angles import clamp, wrap180
 
 ARMED_STATES = frozenset({"ARMING", "TAKEOFF", "HOVER", "YAW_TRACK", "FOLLOW", "TELEOP", "LANDING"})
@@ -91,40 +90,6 @@ class Rejection(enum.Enum):
     # (takeoff while flying, estop_clear while not IDLE). The tracker treats it as a
     # plain refusal.
     WRONG_STATE = "wrong_state"
-
-
-@dataclass(frozen=True)
-class SupervisorLimits:
-    """``config/flight.json`` of the flown supervisor plus the teleop caps."""
-
-    takeoff_alt_m: float = 3.0
-    climb_rate_mps: float = 0.7
-    max_alt_m: float = 15.0
-    geofence_radius_m: float = 30.0
-    min_batt_pct: int = 40
-    min_fix_type: int = 3
-    max_eph_m: float = 1.5
-    enable_channel: int = 7
-    enable_threshold_us: int = 1500
-    rc_stale_s: float = 1.0
-    px4_stale_s: float = 1.0
-    target_stale_s: float = 1.0
-    setpoint_hz: float = 20.0
-    prestream_s: float = 1.5
-    hover_tolerance_m: float = 0.5
-    hover_settle_s: float = 3.0
-    ack_timeout_s: float = 3.0
-    teleop_v_xy_mps: float = 1.5
-    teleop_v_z_mps: float = 0.7
-    teleop_yaw_rate_rps: float = 0.8
-    teleop_stale_s: float = 0.5
-    teleop_lock_altitude: bool = True
-
-
-@dataclass(frozen=True)
-class GuidanceConfig:
-    yaw_track: YawTrackConfig = field(default_factory=YawTrackConfig)
-    follow: FollowConfig = field(default_factory=FollowConfig)
 
 
 @dataclass(frozen=True)
