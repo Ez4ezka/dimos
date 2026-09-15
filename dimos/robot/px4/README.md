@@ -1,41 +1,108 @@
-# PX4 drone (dimosdrone-2)
+# PX4 drone
 
-Holybro X500 on a Pixhawk 6C running PX4 v1.17.0 (custom CRSF build), Jetson Orin Nano
-companion (JetPack 6), SIYI A8 mini gimbal camera on a hanging mount, RTK GNSS, ELRS
-from a RadioMaster TX16S, Quectel RM520N-GL 5G modem. Everything flight-critical runs on
-the Jetson; the operator link is never in the control loop.
+dimOS modules for a PX4 quadcopter: Holybro X500, Pixhawk 6C on PX4 1.17, Jetson Orin
+Nano companion, SIYI A8 mini gimbal camera, Quectel 5G modem. The flight logic is the
+code that flew on 2026-09-09; the plumbing is dimOS.
 
-This package ports the bespoke stack that flew on 2026-09-09 (`~/drone-autonomy`) into
-dimOS modules. The flight logic is the flown code; only the plumbing changed.
+## How it works
 
-## What is in the package
+`Px4DroneConnection` is the only process that talks to PX4. It opens one MAVLink socket,
+publishes the vehicle as dimOS streams (odometry, imu, gps, battery, rc, gimbal attitude,
+status) and runs the Offboard flight supervisor: a state machine that streams setpoints at
+20 Hz through takeoff, hover, yaw-track, follow, teleop and landing. Operator commands are
+RPCs. There is no arm, mode or raw setpoint RPC.
 
-| File | What it is |
-|---|---|
-| `config.py` | The numbers: MAVLink identities, router endpoints, flight limits, guidance gains. Nothing else. |
-| `mavlink.py` | The MAVLink layer: PX4 mode constants, NED/FLU frame conversions, the boot-time-to-UTC timebase, `VehicleState` (every message we use, decoded), and `MavlinkIO` (the one socket, its reader thread, the setpoint senders). |
-| `supervisor_core.py` | The Offboard flight state machine (IDLE, PREFLIGHT, STREAMING, OFFBOARD_REQ, ARMING, TAKEOFF, HOVER, YAW_TRACK, FOLLOW, TELEOP, LANDING, ABORT) and the guidance laws it uses. Pure: no socket, no port, tested against a fake vehicle. |
-| `connection.py` | `Px4DroneConnection`, the Module. Owns the socket and the supervisor, publishes the vehicle as dimOS streams, exposes the operator RPCs. Mirrors `dimos/robot/galaxea/r1pro/connection.py`. |
-| `command_tracker.py` | `CommandTracker`: did that operator command take effect, and if not, why not. Read-only. |
-| `link_monitor.py` | `LinkMonitor`: what the 5G link can carry right now (modem AT, tailscale, ping, counters) and the policy the camera obeys. Advisory only. |
-| `perception/` | `PerceptionBridge` (`bridge.py`) and the flown detector, tracker, geometry and estimators it runs. |
-| `sitl.py` | `FakeA8`, the gimbal the simulator lacks. |
-| `blueprints.py` | The three blueprints below and the one transport map. |
-| `tool_sitl_gate.py`, `tool_tracker_gate.py`, `tool_link_gate.py` | Gates: PASS or FAIL with numbers. |
+Everything else is a separate module that reads or feeds the connection's streams by name.
 
-The camera and gimbal are hardware, not PX4, so they live under `dimos/hardware/`:
-`sensors/camera/rtsp/` (`RtspCamera`) and `gimbal/siyi/` (`SiyiA8Gimbal`, frame maths, SDK).
-The typed messages are under `dimos/msgs/px4_msgs/` and `dimos/msgs/link_msgs/`.
+| Module | Required | What it does | Reads | Writes |
+|---|---|---|---|---|
+| `Px4DroneConnection` | yes | MAVLink bridge + flight supervisor | cmd_vel, estop_in, target_state, target_valid, target_los, gimbal_target | odometry, odom, tf, imu, gps, global_pose, battery, rc, motor_outputs, gimbal_attitude, vehicle_status, statustext, supervisor_state, command_event, offboard_setpoint, stop_movement |
+| `RtspCamera` | no | A8 H.265 stream in, `video`, decoded `color_image`, small `color_jpeg` out | link_policy | video, color_image, color_jpeg |
+| `SiyiA8Gimbal` | no | gimbal tf chain, camera intrinsics, aim requests | gimbal_attitude, target_los | tf, camera_info, gimbal_target |
+| `PerceptionBridge` | no | detector, tracker, line of sight, target position | color_image, odometry, gimbal_attitude, global_pose, vehicle_status, track_select | tracks, target_state, target_valid, target_los |
+| `LinkMonitor` | no | 5G link quality and the video/telemetry policy | nothing | link_status, link_policy |
+| `CommandTracker` | no | scores every operator command: did it take effect, if not why | command_event, offboard_setpoint, odometry, vehicle_status, supervisor_state | tracked_command, command_report, cmd_forward, meas_forward |
+| `FakeA8` | SITL only | stands in for the gimbal hardware | gimbal_target | gimbal_attitude |
 
-## Aircraft-side setup
+A missing optional module never stops anything from starting. You lose what it provided:
 
-Everything in this section runs **on the Jetson**, over ssh (`ezendimos@100.110.224.46`),
-not on your workstation.
+- No camera: no video, perception gets no frames, so no target. FOLLOW and YAW_TRACK
+  hold position.
+- No gimbal module: no gimbal tf chain, no camera_info, nothing aims the gimbal.
+- No perception: no target. Same as no camera for FOLLOW and YAW_TRACK.
+- No link monitor: the camera keeps its configured rates.
+- No tracker: no command scoring.
 
-`mavlink-routerd` owns the Pixhawk UART (`/dev/ttyTHS1`, 921600) and fans out one UDP
-endpoint per service. Add the dimOS endpoint next to the existing ones in
-`/etc/mavlink-router/main.conf` (or `~/autonomy/config/mavlink-router.conf` if the router
-is still started by hand), then restart the router:
+## Files
+
+```
+dimos/robot/px4/
+  config.py            numbers: MAVLink ids, router ports, flight limits, guidance gains
+  mavlink.py           MAVLink layer: PX4 modes, NED/FLU frames, timebase, vehicle state, the socket
+  supervisor_core.py   flight state machine and guidance laws, pure logic, no socket
+  connection.py        Px4DroneConnection, the module
+  command_tracker.py   CommandTracker
+  link_monitor.py      LinkMonitor
+  perception/          PerceptionBridge (bridge.py) plus detector, tracker, geometry, estimators
+  sitl.py              FakeA8
+  blueprints.py        px4-basic, px4-drone, px4-sitl
+  tool_*_gate.py       gates, print PASS or FAIL with numbers
+dimos/hardware/sensors/camera/rtsp/   RtspCamera
+dimos/hardware/gimbal/siyi/           SiyiA8Gimbal, frame maths, SIYI SDK
+dimos/msgs/px4_msgs/, dimos/msgs/link_msgs/   typed messages
+```
+
+## Run
+
+```bash
+dimos run px4-basic    # connection + viewer, on the Jetson
+dimos run px4-drone    # everything on the aircraft
+dimos run px4-sitl     # px4-drone against PX4 SITL, with synthetic camera, fake gimbal, replayed link
+```
+
+`px4-sitl` needs `make px4_sitl gz_x500` running in a PX4 tree. Each module also runs alone
+(`dimos run px4-drone-connection`, `command-tracker`, `rtsp-camera`, `siyi-a8-gimbal`,
+`link-monitor`, `perception-bridge`, `fake-a8`) and binds to whatever else is running.
+
+From `dimos shell`:
+
+```
+px4_drone_connection.sitl_enable(True)     # SITL only, fakes the RC enable switch
+px4_drone_connection.takeoff()
+px4_drone_connection.set_guidance_mode("FOLLOW")   # HOVER, YAW_TRACK, FOLLOW, TELEOP
+px4_drone_connection.land()
+px4_drone_connection.estop()
+px4_drone_connection.status()
+command_tracker.recent()
+perception_bridge.select_track(1)
+link_monitor.status()
+```
+
+## Test
+
+No hardware, no simulator:
+
+```bash
+uv sync --extra px4
+uv run pytest dimos/robot/px4 dimos/hardware/gimbal/siyi dimos/hardware/sensors/camera/rtsp \
+    dimos/msgs/px4_msgs dimos/msgs/link_msgs
+uv run python dimos/robot/px4/tool_link_gate.py       # recorded link scenarios
+uv run python dimos/robot/px4/tool_tracker_gate.py    # scripted commands through zenoh
+```
+
+With PX4 SITL (`make px4_sitl gz_x500` in the PX4 tree):
+
+```bash
+uv run python dimos/robot/px4/tool_sitl_gate.py --fly
+```
+
+This runs `px4-sitl` and checks odometry rate and stamps, the gimbal tf chain, frame
+stamps, track confirmation and line of sight, the link policy, then takes off to 3 m,
+hovers, lands, and checks the tracker scored takeoff and land as ok.
+
+## Aircraft setup
+
+On the Jetson, add a mavlink-router endpoint for this stack and restart the router:
 
 ```ini
 [UdpEndpoint dimos]
@@ -44,207 +111,25 @@ Address = 127.0.0.1
 Port = 14556
 ```
 
-The full endpoint table is `ROUTER_ENDPOINTS` in `config.py`: 14550 gimbal controller
-(component 191), 14551 line of sight (192), 14552 the flown supervisor (193), 14553 logger,
-14554 QGroundControl throttle, 14556 this package (195). Never reuse another service's port.
+Ports 14550 to 14554 belong to the other services (see `ROUTER_ENDPOINTS` in
+`config.py`).
 
-PX4 parameters for companion Offboard flight, set in QGroundControl then reboot:
-`COM_OBL_RC_ACT=5` (Hold on setpoint loss), `COM_OF_LOSS_T=0.5`, `COM_RC_OVERRIDE=3`,
-`NAV_RCL_ACT=2`, `COM_RC_LOSS_T=0.5`, `GF_ACTION=2`, `GF_MAX_HOR_DIST=50`,
-`GF_MAX_VER_DIST=30`, `COM_DISARM_LAND=2`, `MPC_XY_VEL_MAX=3`, `MPC_Z_VEL_MAX_UP=1.5`,
-`MPC_Z_VEL_MAX_DN=1.0`, `COM_ARM_WO_GPS=0`, `COM_HOME_EN=1`. Not yet set on the vehicle as
-of 2026-09-09; verify the failsafe parameter names against v1.17 first. Keep the existing
-`MAV_1_CONFIG=102 MAV_1_MODE=2 MAV_1_FORWARD=1 SER_TEL2_BAUD=921600`, the `MAV_2_*` set
-for the A8, and `MNT_MODE_IN=4 MNT_MODE_OUT=2`.
+PX4 parameters, set in QGC, then reboot: `COM_OBL_RC_ACT=5`, `COM_OF_LOSS_T=0.5`,
+`COM_RC_OVERRIDE=3`, `NAV_RCL_ACT=2`, `COM_RC_LOSS_T=0.5`, `GF_ACTION=2`,
+`GF_MAX_HOR_DIST=50`, `GF_MAX_VER_DIST=30`, `COM_DISARM_LAND=2`, `MPC_XY_VEL_MAX=3`,
+`MPC_Z_VEL_MAX_UP=1.5`, `MPC_Z_VEL_MAX_DN=1.0`, `COM_ARM_WO_GPS=0`, `COM_HOME_EN=1`.
+Check the names against PX4 1.17 first; they were not set as of 2026-09-09.
 
-The flown `flight_supervisor.py` and `Px4DroneConnection` must never run together.
-The connection holds the supervisor's UDP port 5610 as a lock and refuses to start
-while it is taken.
+The flown `flight_supervisor.py` must not run at the same time; the connection holds its
+UDP port 5610 and refuses to start while it is taken. `gimbal_mount_xyz` is a placeholder
+until measured.
 
-## Environment
+## Safety rules
 
-- Install with the `px4` extra (pymavlink, PyAV, pyserial):
-  `uv sync --extra px4` or, for everything, `uv sync --extra all`.
-- On the Jetson use the system Python 3.10 the way the R1 Pro README describes
-  (`uv sync --python /usr/bin/python3.10 --python-preference only-system --extra px4`).
-  The TensorRT detector for the perception bridge only exists there.
-- PX4 SITL on a workstation: the PX4 tree with `make px4_sitl gz_x500`. PX4 refuses to
-  arm without a ground station; `tool_sitl_gate.py` runs a stand-in heartbeat on 14550,
-  and in the field that role is QGroundControl.
-- The gimbal mount offset (`gimbal_mount_xyz`, `mount_xyz`) is an UNMEASURED placeholder
-  and both the connection and the gimbal module warn at start until a measured value
-  replaces it.
-
-## Blueprints
-
-Three, and they are the same stack at three sizes.
-
-```bash
-dimos run px4-basic     # the connection + viewer, on the Jetson against endpoint 14556
-dimos run px4-drone     # the aircraft: + command tracker, A8 camera + gimbal, link monitor, perception
-dimos run px4-sitl      # the simulator twin of px4-drone (`make px4_sitl gz_x500` running)
-```
-
-`px4-sitl` stands in for what the simulator lacks: the camera replays a generated clip
-(`--rtspcamera.url=synthetic`), `FakeA8` answers `gimbal_target` with `gimbal_attitude`,
-the link monitor replays a measured scenario, and the perception bridge runs the blob
-detector on the clip. Every module is also registered on its own (`dimos run
-px4-drone-connection`, `command-tracker`, `rtsp-camera`, `siyi-a8-gimbal`,
-`link-monitor`, `perception-bridge`, `fake-a8`) and binds to a running stack by stream
-name.
-
-Every module except the connection is optional. Remove one from a blueprint and the
-others degrade: no gimbal module means no gimbal tf chain and no camera intrinsics, so the
-perception bridge reports "gimbal attitude stale" and never produces a target; no
-perception means the connection stays in HOVER when FOLLOW is requested; no link monitor
-means the camera keeps its own rates; no tracker means nothing is scored. Nothing fails to
-start.
-
-Then, from `dimos shell`: `px4_drone_connection.sitl_enable(True)`, `.takeoff()`,
-`.set_guidance_mode("FOLLOW")`, `.land()`, `.estop()`, `.status()`, `.sensor_stats()`;
-`command_tracker.recent()`; `link_monitor.status()`; `perception_bridge.select_track(1)`.
-
-## Tests and gates
-
-```bash
-uv run pytest dimos/robot/px4 dimos/hardware/gimbal/siyi dimos/hardware/sensors/camera/rtsp \
-    dimos/msgs/px4_msgs dimos/msgs/link_msgs             # no hardware, no simulator
-uv run python dimos/robot/px4/tool_link_gate.py           # every recorded link scenario, no modem
-uv run python dimos/robot/px4/tool_tracker_gate.py        # four scripted commands through zenoh
-uv run python dimos/robot/px4/tool_sitl_gate.py --fly     # PX4 SITL: the whole twin, then takeoff, hover, land
-uv run mypy dimos/robot/px4 && uv run ruff check dimos/robot/px4
-```
-
-The SITL gate asserts odometry at 25 Hz or better with the stamp lag within 50 ms, the
-gimbal chain in `tf`, frames stamped within 50 ms of the vehicle clock, a track confirmed
-within a few frames and a valid target after selection with the line-of-sight azimuth
-within 2 deg of gimbal yaw plus heading, the link policy allowing video, and with
-`--fly` HOVER then IDLE with the tracker scoring `takeoff` and `land` as `ok`.
-
-## Port contract
-
-Fixed after Round 1; new modules bind by exact name and type. Topics are `dimos/<port>`,
-all declared once in `blueprints.py:px4_transports`.
-
-| Direction | Port | Type | Rate |
-|---|---|---|---|
-| out | odometry, odom, tf | Odometry, PoseStamped, TFMessage | 30 Hz, latest-wins |
-| out | imu | Imu | 50 Hz, latest-wins |
-| out | motor_outputs | JointState (PWM us) | on change, up to 10 Hz |
-| out | gps, global_pose | NavSatFix, PoseStamped (frame `home`) | 5 Hz |
-| out | battery | BatteryState | 1 Hz |
-| out | rc | Joy (raw microseconds) | 5 Hz |
-| out | gimbal_attitude | JointState (radians, flags in effort) | 10 Hz, latest-wins |
-| out | vehicle_status | VehicleStatus | 5 Hz |
-| out | statustext | String, PX4's own messages | as they arrive |
-| out | supervisor_status | String, the flown JSON, transitional | 5 Hz |
-| out | supervisor_state | String | on change |
-| out | command_event | CommandEvent | per operator command |
-| out | offboard_setpoint | Odometry, stamped at the write | 20 Hz |
-| out | robot_state | bytes, hosted UI plane | 2 Hz |
-| out | stop_movement | Bool | event |
-| in | cmd_vel | Twist, body FLU, honoured only in TELEOP | 20 Hz |
-| in | gimbal_target | JointState (`gimbal_pitch`, `gimbal_yaw`) | up to 10 Hz |
-| in | target_state, target_valid, target_los | Odometry, Bool, PoseStamped | 25 Hz |
-| in | estop_in | Bool | event |
-
-RPCs: `takeoff`, `land`, `hold`, `set_guidance_mode`, `estop`, `estop_land`,
-`estop_clear`, `status`, `snapshot`, `sensor_stats`, `sitl_enable`. There is no arm, mode
-or setpoint RPC, and `test_connection.py` asserts it.
-
-## Command tracker
-
-`command_tracker.py` answers "did that operator command take effect, and if not, why
-not" without reading logs. It is read-only: it taps `command_event`, `offboard_setpoint`,
-`odometry`, `vehicle_status` and `supervisor_state`, never opens MAVLink, is never
-imported by the connection, and if it dies flight is unaffected (`test_command_tracker.py`
-asserts it exposes nothing that actuates). Per command it publishes one typed
-`tracked_command` (`TrackedCommand`): the verdict (`ok`, `rejected` with the SupervisorCore
-enum value, `clamped`, `no_setpoint`, `no_motion`, `mode_not_offboard`,
-`not_expected_to_move`, `held`), the supervisor state before and after, and three latency
-segments measured separately and never summed: request to verdict, verdict to the first
-Offboard setpoint reflecting it, that setpoint to the observed odometry response. A held
-teleop key is one event, opened and closed on the connection's motion edges; a takeoff is
-judged on the climb, with its own window for the prestream and the two acks.
-
-From `dimos shell`: `command_tracker.recent()`, `.by_verdict("rejected")`, `.summary()`.
-
-## Link monitor
-
-`link_monitor.py` reports, continuously, what the operator link can carry right now, so
-other modules decide instead of guessing. Advisory only: it never touches the flight path.
-A timer thread polls the Quectel RM520N-GL over AT on `/dev/ttyUSB2` (`AT+QCSQ`,
-`AT+QENG="servingcell"`, the port opened per poll so nothing else is locked out), the
-overlay's own `tailscale status --json` for direct-or-relayed, an ICMP round trip to the
-ground station and the interface counters. It publishes two typed streams: `link_status`
-(signal, band, cell, interface, path, round trip, loss, measured throughput and one derived
-`usable_uplink_bps`) and `link_policy` (video allowed, max video bitrate, JPEG rate,
-telemetry profile). RtspCamera obeys the policy. `set_policy(...)` overrides it,
-`clear_policy()` returns to the derived one. With no modem, no overlay and no serial port
-it publishes NaNs and `healthy=False`, never an exception, so it starts on any laptop.
-`--linkmonitor.source=replay --linkmonitor.replay_scenario=downtown_idle` replays one of
-the scenarios measured on 2026-09-08/09.
-
-Peers are configured explicitly (`peers` in the config: name, tailnet address, role);
-multicast discovery finds nothing on the overlay. One aircraft today; peer transport is a
-later round. Once a second embodiment uses it this module moves to `dimos/network/`.
-
-## Perception
-
-`perception/bridge.py` is the flown perception stack in one process: detector, the
-persistent-ID tracker, the line-of-sight solver and the target ground-position estimator,
-with the geometry and tracker parameters that flew. It consumes RtspCamera's
-`color_image` plus the connection's `odometry`, `gimbal_attitude`, `global_pose` and
-`vehicle_status`, and publishes the three streams the connection reads for FOLLOW and
-YAW_TRACK, `target_state`, `target_valid` and `target_los`, plus `tracks`
-(Detection2DArray, selected track first) for the viewer.
-
-Operator click-to-select arrives on `track_select` as a pixel in the published frame; a
-NaN point clears the selection. The selection persists while the track is lost.
-
-Detectors: `ultralytics` runs a YOLO `.pt` anywhere, or the same TensorRT `.engine` the
-flown `yolo_live_trackfeed.py` built on the Jetson. `blob` is the test double: it finds the
-synthetic clip's bright square by thresholding, so the tracker, line of sight and ground
-intersection run on real pixels without a GPU. A recorded walking-person capture from the
-bench replaces the synthetic clip in the gate when it exists
-(`--rtspcamera.url=capture.mp4`).
-
-## Safety invariants
-
-1. The RC pilot always wins. If PX4 is not in OFFBOARD the software stands down silently
-   and sends no mode command. Pilot escape: flight-mode switch to Position or Hold, or any
-   stick past `COM_RC_STICK_OV`.
-2. Exactly one thing produces Offboard setpoints: the connection's tick thread through
-   `MavlinkIO`.
-3. If the tick stops, the stream stops and PX4's Offboard-loss failsafe puts the aircraft
-   in Hold. Never add a fallback that keeps commanding.
-4. E-STOP is Hold plus a latch. Nothing moves the aircraft until `estop_clear`, which only
-   works in IDLE.
-5. Gimbal aim commands go through the connection (`gimbal_target`) and only when
-   `gimbal_commands_enabled` is set; until then the flown controller on component 191
-   keeps control of the A8.
-
-## Flight gates
-
-Each must pass before the next, props off first, then with a pilot present.
-
-1. Bench, props off: `takeoff` with the enable switch (channel 7) off stays in PREFLIGHT
-   with reason `enable switch off`, returns to IDLE after 10 s, sends zero setpoints and
-   no arm command.
-2. Pilot Position-mode hover, gimbal tracking only.
-3. `takeoff` to 3 m hover, `land`. Check altitude error, setpoint rate, no ABORT.
-4. `set_guidance_mode("YAW_TRACK")`: the airframe yaws to keep the gimbal within 15 deg.
-5. `set_guidance_mode("FOLLOW")`: standoff 12 m at 10 m altitude, 2 m/s cap.
-
-## Frames and conventions
-
-dimOS is FLU (x forward/north, y left/west, z up). MAVLink LOCAL_NED is converted in
-`mavlink.py` with the same signs as `dimos/robot/drone/mavlink_connection.py`. The gimbal
-reports body-relative yaw and earth-stabilised pitch (verified 2026-09-04). Vehicle boot
-time becomes UTC through `Px4Timebase` in `mavlink.py` from SYSTEM_TIME.
-
-## Network reality (measured 2026-09-09)
-
-Wi-Fi direct 7 ms. Both ends on cellular through the Tailscale relay: 86 ms average with
-throttled telemetry, 413 ms and 5 % loss with raw telemetry, and no headroom for video on
-that cell. Nothing flight-critical crosses the link.
+1. The RC pilot always wins. If PX4 leaves OFFBOARD the software stops sending and
+   never sends a mode command.
+2. One writer of setpoints: the connection's tick thread. If it stops, PX4's Offboard-loss
+   failsafe holds.
+3. E-STOP is Hold plus a latch. `estop_clear` only works in IDLE.
+4. Gimbal aim commands only go out when `gimbal_commands_enabled` is set on the
+   connection.
