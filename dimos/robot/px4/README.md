@@ -65,6 +65,7 @@ dimos run px4-drone-connection  # the connection alone, no viewer
 dimos run px4-sitl-tracked      # px4-sitl + CommandTracker scoring every command
 dimos run px4-bench             # aircraft, props off: + A8 video, gimbal chain, tracker
 dimos run px4-sitl-bench        # the bench stack against SITL with a replayed clip and a fake A8
+dimos run px4-field             # aircraft in the field: px4-bench + link monitor
 ```
 
 Then, from `dimos shell`: `px4_drone_connection.sitl_enable(True)`, `.takeoff()`,
@@ -131,6 +132,33 @@ dimos run command-tracker                                  # the tracker alone, 
 ```
 
 From `dimos shell`: `command_tracker.recent()`, `.by_verdict("rejected")`, `.summary()`.
+
+## Link monitor
+
+`link_monitor.py` reports, continuously, what the operator link can carry right now, so
+other modules decide instead of guessing. Advisory only: it never touches the flight path.
+A timer thread polls the Quectel RM520N-GL over AT on `/dev/ttyUSB2` (`AT+QCSQ`,
+`AT+QENG="servingcell"`, the port opened per poll so nothing else is locked out), the
+overlay's own `tailscale status --json` for direct-or-relayed, an ICMP round trip to the
+ground station and the interface counters. It publishes two typed streams: `link_status`
+(signal, band, cell, interface, path, round trip, loss, measured throughput and one derived
+`usable_uplink_bps`) and `link_policy` (video allowed, max video bitrate, JPEG rate,
+telemetry profile). RtspCamera obeys the policy. `set_policy(...)` overrides it,
+`clear_policy()` returns to the derived one. With no modem, no overlay and no serial port
+it publishes NaNs and `healthy=False`, never an exception, so it starts on any laptop.
+
+Peers are configured explicitly (`peers` in the config: name, tailnet address, role);
+multicast discovery finds nothing on the overlay. One aircraft today; peer transport is a
+later round. Once a second embodiment uses it this module moves to `dimos/network/`.
+
+```bash
+uv run pytest dimos/robot/px4/test_link_monitor.py       # replayed AT and overlay readings
+uv run python dimos/robot/px4/tool_link_gate.py          # every recorded scenario against expected bands
+dimos run link-monitor                                   # the module alone (hardware sources)
+dimos run link-monitor --linkmonitor.source=replay       # replayed scenario, no modem
+dimos run px4-field                                      # aircraft in the field: px4-bench + link monitor
+dimos run px4-sitl-field                                 # the same against SITL with a replayed link
+```
 
 ## Safety invariants
 
