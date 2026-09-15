@@ -19,6 +19,7 @@ import math
 import pytest
 
 from dimos.msgs.px4_msgs.CommandEvent import CommandEvent
+from dimos.msgs.px4_msgs.TrackedCommand import TrackedCommand
 from dimos.msgs.px4_msgs.VehicleStatus import VehicleStatus
 
 
@@ -91,3 +92,36 @@ def test_command_event_roundtrip() -> None:
 def test_fingerprints_differ_between_types() -> None:
     with pytest.raises(ValueError):
         CommandEvent.lcm_decode(VehicleStatus().lcm_encode())
+
+
+def test_tracked_command_roundtrip() -> None:
+    tc = TrackedCommand(
+        event_id=3,
+        command="cmd_vel",
+        argument="1.00,0.00,0.00,0.00",
+        source="cmd_vel",
+        verdict="ok",
+        request_ts=1700000000.0,
+        verdict_ts=1700000000.01,
+        commanded_ts=1700000000.05,
+        moved_ts=1700000000.3,
+        mux_ms=10.0,
+        onboard_ms=40.0,
+        response_ms=250.0,
+        setpoint_count=40,
+        setpoint_gap_max_ms=52.0,
+        commanded_peak=1.0,
+        measured_peak=0.9,
+        clamp_ratio=1.0,
+        duration_s=2.0,
+        state_before="TELEOP",
+        state_after="TELEOP",
+        ts=1700000002.0,
+    )
+    back = TrackedCommand.lcm_decode(tc.lcm_encode())
+    assert (back.event_id, back.command, back.verdict, back.rejection) == (3, "cmd_vel", "ok", "")
+    assert (back.mux_ms, back.onboard_ms, back.response_ms) == pytest.approx((10.0, 40.0, 250.0))
+    assert math.isnan(back.link_ms)
+    assert back.setpoint_count == 40 and back.scoring_version == 1
+    assert back.moved_ts == 1700000000.3
+    assert "mux=10ms onboard=40ms response=250ms" in back.report_line()

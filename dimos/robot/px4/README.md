@@ -62,6 +62,7 @@ dimos run px4-basic             # connection + viewer, on the Jetson against end
 dimos run px4-sitl              # same against PX4 SITL (`make px4_sitl gz_x500`)
 dimos run px4-sitl-follow       # + a scripted target for FOLLOW and YAW_TRACK
 dimos run px4-drone-connection  # the connection alone, no viewer
+dimos run px4-sitl-tracked      # px4-sitl + CommandTracker scoring every command
 ```
 
 Then, from `dimos shell`: `px4_drone_connection.sitl_enable(True)`, `.takeoff()`,
@@ -104,6 +105,29 @@ Fixed after Round 1; new modules bind by exact name and type. Topics are `dimos/
 RPCs: `takeoff`, `land`, `hold`, `set_guidance_mode`, `estop`, `estop_land`,
 `estop_clear`, `status`, `snapshot`, `sensor_stats`, `sitl_enable`. There is no arm, mode
 or setpoint RPC, and `test_connection.py` asserts it.
+
+## Command tracker
+
+`command_tracker.py` answers "did that operator command take effect, and if not, why
+not" without reading logs. It is read-only: it taps `command_event`, `offboard_setpoint`,
+`odometry`, `vehicle_status` and `supervisor_state`, never opens MAVLink, is never
+imported by the connection, and if it dies flight is unaffected (`test_command_tracker.py`
+asserts it exposes nothing that actuates). Per command it publishes one typed
+`tracked_command` (`TrackedCommand`): the verdict (`ok`, `rejected` with the SupervisorCore
+enum value, `clamped`, `no_setpoint`, `no_motion`, `mode_not_offboard`,
+`not_expected_to_move`, `held`), the supervisor state before and after, and three latency
+segments measured separately and never summed: request to verdict, verdict to the first
+Offboard setpoint reflecting it, that setpoint to the observed odometry response. A held
+teleop key is one event, opened and closed on the connection's motion edges.
+
+```bash
+uv run pytest dimos/robot/px4/test_command_tracker.py     # synthetic streams, one test per rejection
+uv run python dimos/robot/px4/tool_tracker_gate.py         # four scripted commands through zenoh, no simulator
+dimos run px4-sitl-tracked                                 # px4-sitl + the tracker
+dimos run command-tracker                                  # the tracker alone, binding to a running connection
+```
+
+From `dimos shell`: `command_tracker.recent()`, `.by_verdict("rejected")`, `.summary()`.
 
 ## Safety invariants
 

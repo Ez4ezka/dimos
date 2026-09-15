@@ -129,7 +129,9 @@ def px4_visualization() -> Blueprint:
     raise ValueError(f"Unsupported viewer: {global_config.viewer}")
 
 
-def _zenoh_transport(
+# Public, not underscored like r1pro's: the derived blueprint files under blueprints/*/
+# declare their own modules' streams with it.
+def zenoh_transport(
     topic: str,
     msg_type: type,
     *,
@@ -156,38 +158,38 @@ def px4_control(**connection: Any) -> Blueprint:
             {
                 # Public Twist bus: any module's cmd_vel Out (MovementManager, the viewer's
                 # teleop) drives the connection's cmd_vel In.
-                ("cmd_vel", Twist): _zenoh_transport("/cmd_vel", Twist),
-                ("tele_cmd_vel", Twist): _zenoh_transport("/tele_cmd_vel", Twist),
-                ("gimbal_target", JointState): _zenoh_transport("/gimbal_target", JointState),
-                ("estop_in", Bool): _zenoh_transport("/estop_in", Bool),
+                ("cmd_vel", Twist): zenoh_transport("/cmd_vel", Twist),
+                ("tele_cmd_vel", Twist): zenoh_transport("/tele_cmd_vel", Twist),
+                ("gimbal_target", JointState): zenoh_transport("/gimbal_target", JointState),
+                ("estop_in", Bool): zenoh_transport("/estop_in", Bool),
                 # Perception inputs, the same three FakeTarget and PerceptionBridge publish.
-                ("target_state", Odometry): _zenoh_transport("/target_state", Odometry),
-                ("target_valid", Bool): _zenoh_transport("/target_valid", Bool),
-                ("target_los", PoseStamped): _zenoh_transport("/target_los", PoseStamped),
+                ("target_state", Odometry): zenoh_transport("/target_state", Odometry),
+                ("target_valid", Bool): zenoh_transport("/target_valid", Bool),
+                ("target_los", PoseStamped): zenoh_transport("/target_los", PoseStamped),
                 # Vehicle feedback. Heavy streams are latest-wins: a stale odometry sample
                 # is worse than a dropped one.
-                ("odometry", Odometry): _zenoh_transport("/odometry", Odometry, latest_wins=True),
-                ("odom", PoseStamped): _zenoh_transport("/odom", PoseStamped, latest_wins=True),
-                ("tf", TFMessage): _zenoh_transport("/tf", TFMessage, latest_wins=True),
-                ("imu", Imu): _zenoh_transport("/imu", Imu, latest_wins=True),
-                ("motor_outputs", JointState): _zenoh_transport("/motor_outputs", JointState),
-                ("gps", NavSatFix): _zenoh_transport("/gps", NavSatFix),
-                ("battery", BatteryState): _zenoh_transport("/battery", BatteryState),
-                ("rc", Joy): _zenoh_transport("/rc", Joy),
-                ("gimbal_attitude", JointState): _zenoh_transport(
+                ("odometry", Odometry): zenoh_transport("/odometry", Odometry, latest_wins=True),
+                ("odom", PoseStamped): zenoh_transport("/odom", PoseStamped, latest_wins=True),
+                ("tf", TFMessage): zenoh_transport("/tf", TFMessage, latest_wins=True),
+                ("imu", Imu): zenoh_transport("/imu", Imu, latest_wins=True),
+                ("motor_outputs", JointState): zenoh_transport("/motor_outputs", JointState),
+                ("gps", NavSatFix): zenoh_transport("/gps", NavSatFix),
+                ("battery", BatteryState): zenoh_transport("/battery", BatteryState),
+                ("rc", Joy): zenoh_transport("/rc", Joy),
+                ("gimbal_attitude", JointState): zenoh_transport(
                     "/gimbal_attitude", JointState, latest_wins=True
                 ),
-                ("global_pose", PoseStamped): _zenoh_transport("/global_pose", PoseStamped),
-                ("vehicle_status", VehicleStatus): _zenoh_transport(
+                ("global_pose", PoseStamped): zenoh_transport("/global_pose", PoseStamped),
+                ("vehicle_status", VehicleStatus): zenoh_transport(
                     "/vehicle_status", VehicleStatus
                 ),
-                ("statustext", String): _zenoh_transport("/statustext", String),
+                ("statustext", String): zenoh_transport("/statustext", String),
                 # Supervisor streams.
-                ("supervisor_status", String): _zenoh_transport("/supervisor_status", String),
-                ("supervisor_state", String): _zenoh_transport("/supervisor_state", String),
-                ("command_event", CommandEvent): _zenoh_transport("/command_event", CommandEvent),
-                ("offboard_setpoint", Odometry): _zenoh_transport("/offboard_setpoint", Odometry),
-                ("stop_movement", Bool): _zenoh_transport("/stop_movement", Bool),
+                ("supervisor_status", String): zenoh_transport("/supervisor_status", String),
+                ("supervisor_state", String): zenoh_transport("/supervisor_state", String),
+                ("command_event", CommandEvent): zenoh_transport("/command_event", CommandEvent),
+                ("offboard_setpoint", Odometry): zenoh_transport("/offboard_setpoint", Odometry),
+                ("stop_movement", Bool): zenoh_transport("/stop_movement", Bool),
                 # robot_state (bytes) stays on the default transport; the hosted blueprint
                 # binds it to the operator link.
             }
