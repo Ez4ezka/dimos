@@ -340,6 +340,13 @@ drone = [
     "pymavlink"
 ]
 
+# PX4 companion stack (dimos/robot/px4): MAVLink, RTSP demux for the SIYI A8, modem AT port.
+px4 = [
+    "pymavlink",
+    "av",
+    "pyserial",
+]
+
 dds = [
     "cyclonedds>=0.10.5",
 ]
@@ -382,7 +389,7 @@ graspgenx = [
 ]
 
 all = [
-    "dimos[apriltag,cuda,drone,manipulation,misc,scene,unitree,webrtc]",
+    "dimos[apriltag,cuda,drone,manipulation,misc,px4,scene,unitree,webrtc]",
 ]
 
 [dependency-groups]
@@ -688,6 +695,8 @@ module = [
     "scipy",
     "scipy.*",
     "sensor_msgs.*",
+    "serial",
+    "serial.*",
     "sqlite_vec",
     "std_msgs.*",
     "tf2_msgs.*",
