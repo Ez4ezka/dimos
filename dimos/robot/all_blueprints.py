@@ -319,6 +319,7 @@ all_modules = {
     "security-module": "dimos.experimental.security_demo.security_module.SecurityModule",
     "semantic-search": "dimos.memory.module.SemanticSearch",
     "simple-phone-teleop": "dimos.teleop.phone.phone_extensions.SimplePhoneTeleop",
+    "siyi-a8-gimbal": "dimos.hardware.gimbal.siyi.gimbal.SiyiA8Gimbal",
     "spatial-memory": "dimos.perception.experimental.spatial_perception.SpatialMemory",
     "speak-skill": "dimos.agents.skills.speak_skill.SpeakSkill",
     "spot-high-level": "dimos.experimental.robot.bosdyn.spot.effectors.high_level.SpotHighLevel",
