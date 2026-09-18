@@ -297,6 +297,7 @@ all_modules = {
     "path-following-coordinator": "dimos.control.path_following_coordinator.PathFollowingCoordinator",
     "patrolling-module": "dimos.navigation.patrolling.module.PatrollingModule",
     "perceive-loop-skill": "dimos.perception.experimental.perceive_loop_skill.PerceiveLoopSkill",
+    "perception-bridge": "dimos.robot.px4.perception.bridge.PerceptionBridge",
     "person-follow-skill-container": "dimos.agents.skills.person_follow.PersonFollowSkillContainer",
     "person-tracker": "dimos.perception.detection.person_tracker.PersonTracker",
     "phone-teleop-module": "dimos.teleop.phone.phone_teleop_module.PhoneTeleopModule",
