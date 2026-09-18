@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The three PX4 blueprints: the connection alone, the aircraft, and its simulator twin.
+"""The PX4 blueprints: the connection alone, the aircraft, its simulator twin, and teleop.
 
 ``px4-basic``
     Px4DroneConnection plus the viewer. On the Jetson against mavlink-router endpoint 14556.
@@ -24,6 +24,9 @@
     is stood in for: the camera replays a generated clip, FakeA8 answers as the gimbal, the
     link monitor replays a measured scenario, the perception bridge runs the blob detector.
     ``tool_sitl_gate.py`` runs this blueprint end to end.
+``px4-teleop``, ``px4-sitl-teleop``
+    The aircraft and its twin with the viewer's keyboard on ``cmd_vel``, the way
+    ``r1pro-teleop`` wires it. The agent layer on top is in ``blueprints_agentic.py``.
 
 Every module except the connection is optional. Each binds to the others by stream name and
 type, and each is written to degrade when a peer is absent (no gimbal attitude means no
@@ -277,3 +280,11 @@ px4_sitl = (
     .transports(px4_transports())
     .global_config(transport="zenoh", n_workers=2)
 )
+
+# Viewer keyboard teleop, as in r1pro_teleop: the dimos-viewer's WASD twist drives cmd_vel.
+# The connection honours it only in TELEOP, so the keys do nothing until the operator
+# selects that mode.
+_VIEWER_TELEOP = [(RerunWebSocketServer, "tele_cmd_vel", "cmd_vel")]
+
+px4_teleop = px4_drone.remappings(_VIEWER_TELEOP)
+px4_sitl_teleop = px4_sitl.remappings(_VIEWER_TELEOP)

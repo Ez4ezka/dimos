@@ -113,9 +113,24 @@ class FollowConfig:
 
 
 @dataclass(frozen=True)
+class GotoConfig:
+    """Operator go-to. Not flown yet: walking-pace caps, the same altitude law as FOLLOW."""
+
+    k_pos: float = 0.6
+    k_alt: float = 0.6
+    v_max_mps: float = 1.0
+    vz_max_mps: float = 0.7
+    yaw_tolerance_deg: float = 5.0
+    # A goal never reached (wind, a PX4 limit) ends in HOVER where the vehicle is. The fence
+    # keeps every goal under 30 s of flight at v_max_mps.
+    timeout_s: float = 60.0
+
+
+@dataclass(frozen=True)
 class GuidanceConfig:
     yaw_track: YawTrackConfig = field(default_factory=YawTrackConfig)
     follow: FollowConfig = field(default_factory=FollowConfig)
+    goto: GotoConfig = field(default_factory=GotoConfig)
 
 
 @dataclass(frozen=True)
@@ -129,6 +144,10 @@ class SupervisorLimits:
     climb_rate_mps: float = 0.7
     max_alt_m: float = 15.0
     geofence_radius_m: float = 30.0
+    # Operator-chosen altitudes and go-to goals: no lower than min_alt_m, and this far
+    # inside the ceiling and the fence so an overshoot never trips the abort rule.
+    min_alt_m: float = 1.0
+    goal_margin_m: float = 2.0
     min_batt_pct: int = 40
     min_fix_type: int = 3
     max_eph_m: float = 1.5
@@ -147,4 +166,7 @@ class SupervisorLimits:
     teleop_v_z_mps: float = 0.7
     teleop_yaw_rate_rps: float = 0.8
     teleop_stale_s: float = 0.5
+    # Locked, TELEOP holds the altitude it started at (by teleop_k_alt) and ignores the
+    # up axis; the viewer's keyboard has no up or down key.
     teleop_lock_altitude: bool = True
+    teleop_k_alt: float = 0.6

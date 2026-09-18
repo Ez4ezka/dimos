@@ -942,9 +942,41 @@ class Px4DroneConnection(Module):
         return self._result(None)
 
     @rpc
-    def takeoff(self) -> dict[str, Any]:
-        """Run preflight and, if it passes, stream, enter OFFBOARD, arm and climb to hover."""
-        return self._command("takeoff", "", lambda core, io: core.takeoff_cmd(self._snap()))
+    def takeoff(self, altitude_m: float | None = None) -> dict[str, Any]:
+        """Run preflight and, if it passes, stream, enter OFFBOARD, arm and climb to hover.
+
+        ``altitude_m`` is above the ground; None takes ``limits.takeoff_alt_m``.
+        """
+        argument = "" if altitude_m is None else f"{altitude_m:.2f}"
+        return self._command(
+            "takeoff", argument, lambda core, io: core.takeoff_cmd(self._snap(), alt_m=altitude_m)
+        )
+
+    @rpc
+    def go_to(
+        self,
+        north_m: float = 0.0,
+        east_m: float = 0.0,
+        altitude_m: float | None = None,
+        heading_deg: float | None = None,
+        relative: bool = True,
+    ) -> dict[str, Any]:
+        """Fly to a point at walking pace and hover there. Only while flying under this module.
+
+        ``north_m``/``east_m`` count from the vehicle (``relative``) or from the takeoff
+        point. ``altitude_m`` is above the takeoff point and ``heading_deg`` is a compass
+        heading; None keeps the current one. Refused outside the fence or the ceiling.
+        """
+        alt = math.nan if altitude_m is None else altitude_m
+        heading = math.nan if heading_deg is None else heading_deg
+        argument = f"{north_m:.2f},{east_m:.2f},{alt:.2f},{heading:.1f},{int(relative)}"
+        return self._command(
+            "go_to",
+            argument,
+            lambda core, io: core.goto_cmd(
+                self._snap(), north_m, east_m, altitude_m, heading_deg, relative
+            ),
+        )
 
     @rpc
     def land(self) -> dict[str, Any]:

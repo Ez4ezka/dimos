@@ -186,6 +186,65 @@ def test_response_uses_the_commanded_body_axis(tracker: CommandTracker) -> None:
     assert tc["measured_peak"] == pytest.approx(0.6, abs=1e-9)
 
 
+def test_go_to_is_scored_on_ground_speed_whatever_the_heading(tracker: CommandTracker) -> None:
+    # Facing north and flying east: nothing along the body-forward axis, 1 m/s over ground.
+    tracker._on_vehicle_status(_vehicle())
+    tracker._on_command_event(
+        _event(command="go_to", argument="0.00,5.00,nan,nan,1"), now=T0 + 0.011
+    )
+    tracker._on_offboard_setpoint(_odom(T0 + 0.05, vy=-1.0))
+    tracker._on_odometry(_odom(T0 + 0.40, vy=-0.6))
+    tracker.sweep(now=T0 + 0.5)
+    (tc,) = tracker.recent()
+    assert tc["command"] == "go_to" and tc["verdict"] == "ok"
+    assert tc["measured_peak"] == pytest.approx(0.6)
+    assert tc["response_ms"] == pytest.approx(350.0)
+
+
+def test_go_to_back_to_the_takeoff_point_is_a_flight_not_a_turn(tracker: CommandTracker) -> None:
+    # north = east = 0 with relative=0 flies to the takeoff point: scored on speed, not yaw.
+    tracker._on_vehicle_status(_vehicle())
+    tracker._on_command_event(
+        _event(command="go_to", argument="0.00,0.00,nan,nan,0"), now=T0 + 0.011
+    )
+    tracker._on_offboard_setpoint(_odom(T0 + 0.05, vx=1.0))
+    tracker._on_odometry(_odom(T0 + 0.40, vx=0.7))
+    tracker.sweep(now=T0 + 0.5)
+    (tc,) = tracker.recent()
+    assert tc["verdict"] == "ok" and tc["measured_peak"] == pytest.approx(0.7)
+
+
+def test_go_to_turn_on_the_spot_is_scored_on_yaw_rate(tracker: CommandTracker) -> None:
+    tracker._on_vehicle_status(_vehicle())
+    tracker._on_command_event(
+        _event(command="go_to", argument="0.00,0.00,nan,90.0,1"), now=T0 + 0.011
+    )
+    tracker._on_offboard_setpoint(_odom(T0 + 0.05))  # zero velocity, the heading moves
+    turning = _odom(T0 + 0.40)
+    turning.twist.angular.z = -0.5
+    tracker._on_odometry(turning)
+    tracker.sweep(now=T0 + 0.5)
+    (tc,) = tracker.recent()
+    assert tc["verdict"] == "ok" and tc["measured_peak"] == pytest.approx(0.5)
+
+
+def test_teleop_setpoint_is_projected_with_the_vehicle_heading(tracker: CommandTracker) -> None:
+    # Heading east, W held. A teleop setpoint commands a yaw rate, so its own pose has no
+    # heading; read with heading 0 the command vanishes from the forward axis ("clamped").
+    east = -math.pi / 2
+    tracker._on_vehicle_status(_vehicle())
+    tracker._on_odometry(_odom(T0, yaw=east))
+    tracker._on_command_event(_event(argument="0.50,0.00,0.00,0.00"), now=T0 + 0.011)
+    tracker._on_offboard_setpoint(_odom(T0 + 0.05, vy=-0.5))
+    tracker._on_odometry(_odom(T0 + 0.30, vy=-0.4, yaw=east))
+    tracker._on_command_event(
+        _event(command="cmd_vel_release", ts=T0 + 1.0, request_id=2), now=T0 + 1.0
+    )
+    (tc,) = tracker.recent()
+    assert tc["verdict"] == "ok"
+    assert tc["commanded_peak"] == pytest.approx(0.5)
+
+
 def test_no_setpoint_when_nothing_is_streamed(tracker: CommandTracker) -> None:
     tracker._on_vehicle_status(_vehicle())
     tracker._on_command_event(_event(), now=T0 + 0.011)

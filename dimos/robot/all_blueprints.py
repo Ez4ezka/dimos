@@ -102,6 +102,8 @@ all_blueprints = {
     "px4-basic": "dimos.robot.px4.blueprints:px4_basic",
     "px4-drone": "dimos.robot.px4.blueprints:px4_drone",
     "px4-sitl": "dimos.robot.px4.blueprints:px4_sitl",
+    "px4-sitl-teleop": "dimos.robot.px4.blueprints:px4_sitl_teleop",
+    "px4-teleop": "dimos.robot.px4.blueprints:px4_teleop",
     "r1pro-coordinator": "dimos.robot.galaxea.r1pro.blueprints.basic.r1pro_coordinator:r1pro_coordinator",
     "r1pro-manipulation": "dimos.robot.galaxea.r1pro.blueprints.manipulation.r1pro_manipulation:r1pro_manipulation",
     "r1pro-nav": "dimos.robot.galaxea.r1pro.blueprints.navigation.r1pro_nav:r1pro_nav",

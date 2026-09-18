@@ -135,10 +135,27 @@ def _parse_cmd_vel(argument: str) -> tuple[str, float]:
     return axis, axes[axis]
 
 
-def _body_component(msg: Odometry, axis: str) -> float:
-    """Signed velocity of an FLU-frame odometry or setpoint along a body axis."""
-    yaw = msg.orientation.to_euler().z
+def _parse_go_to(argument: str) -> str:
+    """The axis a go-to shows up on: ``yaw`` for a turn on the spot, else 3D ``speed``."""
+    try:
+        north, east, alt, _heading, relative = (float(v) for v in argument.split(","))
+    except ValueError:
+        return "speed"
+    # Zero offsets from the takeoff point (relative=0) still mean flying back to it.
+    on_the_spot = relative == 1.0 and north == 0.0 and east == 0.0 and math.isnan(alt)
+    return "yaw" if on_the_spot else "speed"
+
+
+def _body_component(msg: Odometry, axis: str, heading: Odometry | None = None) -> float:
+    """Signed velocity of an FLU-frame odometry or setpoint along a body axis.
+
+    The body axes are those of ``heading`` when given. A setpoint needs it: a teleop
+    setpoint commands a yaw rate, so its own pose carries no heading.
+    """
+    yaw = (msg if heading is None else heading).orientation.to_euler().z
     vx, vy, vz = msg.vx, msg.vy, msg.twist.linear.z
+    if axis == "speed":
+        return math.hypot(vx, vy, vz)
     c, s = math.cos(yaw), math.sin(yaw)
     if axis == "forward":
         return vx * c + vy * s
@@ -231,6 +248,8 @@ class CommandTracker(Module):
                 axis, requested = _parse_cmd_vel(ev.argument)
             elif ev.command == "takeoff":
                 axis, requested = "up", math.inf
+            elif ev.command == "go_to":
+                axis, requested = _parse_go_to(ev.argument), math.inf
             elif ev.command in _STOP_COMMANDS:
                 axis, requested = "forward", 0.0
             o = _Open(
@@ -250,8 +269,8 @@ class CommandTracker(Module):
 
     def _on_offboard_setpoint(self, sp: Odometry) -> None:
         with self._lock:
-            commanded = _body_component(sp, "forward")
-            self.cmd_forward.publish(Float32(commanded))
+            heading = self._last_odom
+            self.cmd_forward.publish(Float32(_body_component(sp, "forward", heading)))
             for o in self._open:
                 if sp.ts < o.event.verdict_ts:
                     continue
@@ -265,7 +284,7 @@ class CommandTracker(Module):
                     continue
                 if math.isnan(o.commanded_ts):
                     o.commanded_ts = sp.ts
-                o.commanded_peak = max(o.commanded_peak, abs(_body_component(sp, o.axis)))
+                o.commanded_peak = max(o.commanded_peak, abs(_body_component(sp, o.axis, heading)))
 
     def _on_odometry(self, od: Odometry) -> None:
         with self._lock:

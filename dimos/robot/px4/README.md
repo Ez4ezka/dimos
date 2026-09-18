@@ -9,8 +9,8 @@ code that flew on 2026-09-09; the plumbing is dimOS.
 `Px4DroneConnection` is the only process that talks to PX4. It opens one MAVLink socket,
 publishes the vehicle as dimOS streams (odometry, imu, gps, battery, rc, gimbal attitude,
 status) and runs the Offboard flight supervisor: a state machine that streams setpoints at
-20 Hz through takeoff, hover, yaw-track, follow, teleop and landing. Operator commands are
-RPCs. There is no arm, mode or raw setpoint RPC.
+20 Hz through takeoff, hover, yaw-track, follow, teleop, go-to and landing. Operator commands
+are RPCs. There is no arm, mode or raw setpoint RPC.
 
 Everything else is a separate module that reads or feeds the connection's streams by name.
 
@@ -45,7 +45,7 @@ dimos/robot/px4/
   link_monitor.py      LinkMonitor
   perception/          PerceptionBridge (bridge.py) plus detector, tracker, geometry, estimators
   sitl.py              FakeA8
-  blueprints.py        px4-basic, px4-drone, px4-sitl
+  blueprints.py        px4-basic, px4-drone, px4-sitl, px4-teleop, px4-sitl-teleop
   tool_*_gate.py       gates, print PASS or FAIL with numbers
 dimos/hardware/sensors/camera/rtsp/   RtspCamera
 dimos/hardware/gimbal/siyi/           SiyiA8Gimbal, frame maths, SIYI SDK
@@ -57,26 +57,50 @@ dimos/msgs/px4_msgs/, dimos/msgs/link_msgs/   typed messages
 ```bash
 dimos run px4-basic    # connection + viewer, on the Jetson
 dimos run px4-drone    # everything on the aircraft
+dimos run px4-teleop   # px4-drone + the viewer's keyboard
 dimos run px4-sitl     # px4-drone against PX4 SITL, with synthetic camera, fake gimbal, replayed link
 ```
 
-`px4-sitl` needs `make px4_sitl gz_x500` running in a PX4 tree. Each module also runs alone
-(`dimos run px4-drone-connection`, `command-tracker`, `rtsp-camera`, `siyi-a8-gimbal`,
+`px4-sitl` and `px4-sitl-teleop` need `make px4_sitl gz_x500` running in
+a PX4 tree, and a ground station on 14550 (QGC) or PX4 refuses to arm. Each module also runs
+alone (`dimos run px4-drone-connection`, `command-tracker`, `rtsp-camera`, `siyi-a8-gimbal`,
 `link-monitor`, `perception-bridge`, `fake-a8`) and binds to whatever else is running.
+`dimos --record sqlite run <blueprint>` keeps every stream of the run in
+`recordings/<run-id>/memory.db`.
 
-From `dimos shell`:
+### Commands
+
+From `dimos shell`, in any blueprint:
 
 ```
-px4_drone_connection.sitl_enable(True)     # SITL only, fakes the RC enable switch
-px4_drone_connection.takeoff()
-px4_drone_connection.set_guidance_mode("FOLLOW")   # HOVER, YAW_TRACK, FOLLOW, TELEOP
-px4_drone_connection.land()
-px4_drone_connection.estop()
-px4_drone_connection.status()
-command_tracker.recent()
-perception_bridge.select_track(1)
-link_monitor.status()
+drone = app.Px4DroneConnection
+drone.sitl_enable(True)                  # SITL only, fakes the RC enable switch
+drone.takeoff(2.0)                       # metres above the ground; no argument = limits.takeoff_alt_m
+drone.go_to(north_m=-2, altitude_m=3)    # 2 m south of here, at 3 m above the takeoff point
+drone.go_to(relative=False, heading_deg=90)   # back over the takeoff point, facing east
+drone.set_guidance_mode("TELEOP")        # HOVER, YAW_TRACK, FOLLOW, TELEOP
+drone.land()
+drone.estop()
+drone.status()
+app.CommandTracker.recent()
+app.PerceptionBridge.select_track(1)
+app.LinkMonitor.status()
 ```
+
+A go-to flies at walking pace (`GotoConfig`), ends in HOVER at the goal, and is refused
+unless the goal is `goal_margin_m` inside the fence and the ceiling (`SupervisorLimits`).
+`set_guidance_mode("HOVER")` stops one on the spot.
+
+### Keyboard
+
+`px4-teleop` wires the dimos-viewer's keyboard to `cmd_vel` the way `r1pro-teleop` does.
+On the Jetson run `dimos --rerun-open none --rerun-host 0.0.0.0 run px4-teleop` (the
+viewer servers listen on localhost otherwise) and connect the viewer from the laptop with
+the `dimos-viewer --connect ... --ws-url ...` line it logs. Then take off, select TELEOP,
+click the keyboard overlay in the viewer and fly: W/S forward and back, Q/E strafe, A/D
+turn, Shift faster, Space stop. Keys do nothing outside TELEOP (the tracker shows them as
+`rejected/not_teleop`), speeds are clamped to the teleop limits, the altitude stays where
+TELEOP started, and when the keys stop arriving the vehicle holds position.
 
 ## Test
 
@@ -97,8 +121,9 @@ uv run python dimos/robot/px4/tool_sitl_gate.py --fly
 ```
 
 This runs `px4-sitl` and checks odometry rate and stamps, the gimbal tf chain, frame
-stamps, track confirmation and line of sight, the link policy, then takes off to 3 m,
-hovers, lands, and checks the tracker scored takeoff and land as ok.
+stamps, track confirmation and line of sight, the link policy, then flies the operator
+commands: takeoff to 2 m, go 2 m south at 3 m, a go-to past the fence refused, a held
+teleop key, land, and the tracker's verdict on each.
 
 ## Aircraft setup
 
@@ -133,3 +158,6 @@ until measured.
 3. E-STOP is Hold plus a latch. `estop_clear` only works in IDLE.
 4. Gimbal aim commands only go out when `gimbal_commands_enabled` is set on the
    connection.
+5. Operator numbers are checked before anything moves: a takeoff altitude or a go-to goal
+   outside the fence, the ceiling or `min_alt_m` is refused, and GOTO obeys the same abort
+   rules as every other armed state.

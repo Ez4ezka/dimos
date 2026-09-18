@@ -17,14 +17,16 @@
 Start ``make px4_sitl gz_x500`` in the PX4 tree, then::
 
     python dimos/robot/px4/tool_sitl_gate.py          # telemetry, camera, gimbal, perception, link
-    python dimos/robot/px4/tool_sitl_gate.py --fly    # + takeoff, hover, land, scored by the tracker
+    python dimos/robot/px4/tool_sitl_gate.py --fly    # + the operator flight, scored by the tracker
 
 Asserts: odometry at 25 Hz or better with the reader-side stamp lag within 50 ms; ``tf``
 carries the gimbal chain; frames stamped within 50 ms of the vehicle's odometry clock; a
 track confirmed within MIN_HITS + 5 frames, a valid target after selection, and the
 line-of-sight azimuth within 2 deg of gimbal yaw plus heading; the aim path moved the fake
-A8 to where the gimbal module reports it; the replayed link allows video. With ``--fly``:
-HOVER within 60 s, IDLE after land, and the command tracker scores both ``ok``.
+A8 to where the gimbal module reports it; the replayed link allows video. With ``--fly``
+the operator flight: takeoff to 2 m, go 2 m south at 3 m, a go-to past the fence refused,
+a held teleop key moving the vehicle along its heading at a locked altitude and holding
+on release, land to IDLE, and the command tracker scoring each of them.
 """
 
 from __future__ import annotations
@@ -41,6 +43,8 @@ from dimos.core.coordination.module_coordinator import ModuleCoordinator
 from dimos.hardware.gimbal.siyi.gimbal import SiyiA8Gimbal
 from dimos.msgs.foxglove_msgs.CompressedVideo import CompressedVideo
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
+from dimos.msgs.geometry_msgs.Twist import Twist
+from dimos.msgs.geometry_msgs.Vector3 import Vector3
 from dimos.msgs.link_msgs.LinkPolicy import LinkPolicy
 from dimos.msgs.nav_msgs.Odometry import Odometry
 from dimos.msgs.tf2_msgs.TFMessage import TFMessage
@@ -52,6 +56,7 @@ from dimos.robot.px4.link_monitor import LinkMonitor
 from dimos.robot.px4.perception.bridge import PerceptionBridge
 from dimos.robot.px4.perception.tracker import MIN_HITS
 from dimos.robot.px4.sitl import FakeA8
+from dimos.robot.px4.supervisor_core import GOTO_ARRIVED
 
 _STAMP_BOUND_MS = 50.0
 _CONFIRM_WITHIN_FRAMES = MIN_HITS + 5
@@ -62,6 +67,11 @@ _CHAIN = {
     ("gimbal_base", "gimbal_link"),
     ("gimbal_link", "a8_optical"),
 }
+# The operator flight: how close the simulated vehicle must end up, and the teleop key.
+_POSITION_TOL_M = 0.3
+_SETTLE_S = 4.0
+_KEY_SPEED_MPS = 0.5
+_KEY_HELD_S = 4.0
 
 
 def _fake_gcs(stop: threading.Event) -> None:
@@ -82,7 +92,7 @@ def _fake_gcs(stop: threading.Event) -> None:
 
 def _wait_state(drone: Any, wanted: set[str], timeout_s: float) -> str:
     deadline = time.time() + timeout_s
-    state = ""
+    state: str = ""
     while time.time() < deadline:
         state = drone.status()["state"]
         if state in wanted:
@@ -93,6 +103,76 @@ def _wait_state(drone: Any, wanted: set[str], timeout_s: float) -> str:
 
 def _wrap(deg: float) -> float:
     return (deg + 180.0) % 360.0 - 180.0
+
+
+def _place(drone: Any) -> tuple[float, float, float]:
+    """(north, east, altitude) from the takeoff point, metres."""
+    st = drone.status()
+    return st["north_m"], st["east_m"], st["alt_m"]
+
+
+def _near(place: tuple[float, float, float], wanted: tuple[float, float, float]) -> bool:
+    return all(abs(a - b) <= _POSITION_TOL_M for a, b in zip(place, wanted, strict=True))
+
+
+def _fly(coordinator: ModuleCoordinator, drone: Any, tracker: Any) -> bool:
+    """The operator flight. Every step prints what it saw; returns whether all of it held."""
+    print("sitl_enable:", drone.sitl_enable(True))
+    print("takeoff(2.0):", drone.takeoff(2.0))
+    state = _wait_state(drone, {"HOVER", "IDLE", "ABORT"}, timeout_s=60.0)
+    time.sleep(_SETTLE_S)
+    place = _place(drone)
+    print(f"after takeoff: state={state} reason={drone.status()['reason']!r} place={place}")
+    ok: bool = state == "HOVER" and _near(place, (0.0, 0.0, 2.0))
+
+    print("go_to 2 m south at 3 m:", drone.go_to(north_m=-2.0, altitude_m=3.0))
+    state = _wait_state(drone, {"HOVER", "IDLE", "ABORT"}, timeout_s=60.0)
+    reason = drone.status()["reason"]
+    time.sleep(_SETTLE_S)
+    place = _place(drone)
+    print(f"after go_to: state={state} reason={reason!r} place={place}")
+    ok &= state == "HOVER" and reason == GOTO_ARRIVED and _near(place, (-2.0, 0.0, 3.0))
+
+    refused = drone.go_to(north_m=100.0)
+    print("go_to past the fence:", refused)
+    ok &= refused == {"accepted": False, "rejection": "fence", "state": "HOVER"}
+
+    # A held key, the way the viewer sends it: a fresh Twist every frame, then nothing.
+    print("TELEOP:", drone.set_guidance_mode("TELEOP"))
+    cmd_vel = coordinator.transports[("cmd_vel", Twist)]
+    key = Twist(Vector3(_KEY_SPEED_MPS, 0.0, 0.0), Vector3())
+    deadline = time.time() + _KEY_HELD_S
+    while time.time() < deadline:
+        cmd_vel.publish(key)
+        time.sleep(0.05)
+    time.sleep(_SETTLE_S)
+    north, east, alt = _place(drone)
+    moved = math.hypot(north - place[0], east - place[1])
+    print(f"after the key: moved {moved:.2f} m, altitude {alt:.2f} m")
+    ok &= 0.5 * _KEY_SPEED_MPS * _KEY_HELD_S <= moved <= 1.5 * _KEY_SPEED_MPS * _KEY_HELD_S
+    ok &= abs(alt - 3.0) <= _POSITION_TOL_M
+    time.sleep(2.0)
+    held = _place(drone)
+    print(f"key released, holding: drift {math.hypot(held[0] - north, held[1] - east):.2f} m")
+    ok &= _near(held, (north, east, alt))
+
+    print("land:", drone.land())
+    state = _wait_state(drone, {"IDLE", "ABORT"}, timeout_s=60.0)
+    print(f"after land: state={state} reason={drone.status()['reason']!r}")
+    print(f"tick jitter ms (flight): {drone.sensor_stats()['tick_jitter_ms']}")
+    ok &= state == "IDLE"
+    time.sleep(1.0)  # the tracker closes `land` once the setpoint stream has ended
+    verdicts = [(tc["command"], tc["verdict"]) for tc in tracker.recent()]
+    print("tracker verdicts:", verdicts)
+    for scored in (
+        ("takeoff", "ok"),
+        ("go_to", "ok"),
+        ("go_to", "rejected"),
+        ("cmd_vel", "ok"),
+        ("land", "ok"),
+    ):
+        ok &= scored in verdicts
+    return ok
 
 
 class _Taps:
@@ -144,7 +224,7 @@ class _Taps:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seconds", type=float, default=15.0, help="passive listening window")
-    ap.add_argument("--fly", action="store_true", help="sitl_enable + takeoff + hover + land")
+    ap.add_argument("--fly", action="store_true", help="fly the operator commands as well")
     args = ap.parse_args()
 
     gcs_stop = threading.Event()
@@ -238,24 +318,9 @@ def main() -> int:
         print("link:", link.path(), "policy:", None if policy is None else policy.reason)
         ok &= policy is not None and policy.video_allowed
 
-        # 5. Flight, scored by the tracker.
+        # 5. The operator flight, scored by the tracker.
         if args.fly:
-            print("sitl_enable:", drone.sitl_enable(True))
-            print("takeoff:", drone.takeoff())
-            st_name = _wait_state(drone, {"HOVER", "IDLE", "ABORT"}, timeout_s=60.0)
-            st = drone.status()
-            print(f"after takeoff: state={st_name} reason={st['reason']!r} alt_m={st.get('alt_m')}")
-            ok &= st_name == "HOVER"
-            time.sleep(5.0)
-            print("land:", drone.land())
-            st_name = _wait_state(drone, {"IDLE", "ABORT"}, timeout_s=60.0)
-            print(f"after land: state={st_name} reason={drone.status()['reason']!r}")
-            print(f"tick jitter ms (flight): {drone.sensor_stats()['tick_jitter_ms']}")
-            ok &= st_name == "IDLE"
-            time.sleep(1.0)  # the tracker closes `land` once the setpoint stream has ended
-            verdicts = {tc["command"]: tc["verdict"] for tc in tracker.recent()}
-            print("tracker verdicts:", verdicts)
-            ok &= verdicts.get("takeoff") == "ok" and verdicts.get("land") == "ok"
+            ok &= _fly(coordinator, drone, tracker)
         print("camera stats:", coordinator.get_instance("rtspcamera").sensor_stats())
     finally:
         coordinator.stop()
