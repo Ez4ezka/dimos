@@ -16,12 +16,14 @@
 
 Start ``make px4_sitl gz_x500`` in the PX4 tree, then::
 
-    python dimos/robot/px4/tool_sitl_gate.py          # telemetry, camera, gimbal
+    python dimos/robot/px4/tool_sitl_gate.py          # telemetry, camera, gimbal, perception, link
     python dimos/robot/px4/tool_sitl_gate.py --fly    # + the operator flight, scored by the tracker
 
 Asserts: odometry at 25 Hz or better with the reader-side stamp lag within 50 ms; ``tf``
-carries the gimbal chain; frames stamped within 50 ms of the vehicle's odometry clock; the
-gimbal module reports the fake A8's attitude. With ``--fly``
+carries the gimbal chain; frames stamped within 50 ms of the vehicle's odometry clock; a
+track confirmed within MIN_HITS + 5 frames, a valid target after selection, and the
+line-of-sight azimuth within 2 deg of gimbal yaw plus heading; the aim path moved the fake
+A8 to where the gimbal module reports it; the replayed link allows video. With ``--fly``
 the operator flight: takeoff to 2 m, go 2 m south at 3 m, a go-to past the fence refused,
 a held teleop key moving the vehicle along its heading at a locked altitude and holding
 on release, land to IDLE, and the command tracker scoring each of them.
@@ -40,17 +42,25 @@ from dimos.core.coordination.blueprint_config.parser import BlueprintConfigParse
 from dimos.core.coordination.module_coordinator import ModuleCoordinator
 from dimos.hardware.gimbal.siyi.gimbal import SiyiA8Gimbal
 from dimos.msgs.foxglove_msgs.CompressedVideo import CompressedVideo
+from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
+from dimos.msgs.link_msgs.LinkPolicy import LinkPolicy
 from dimos.msgs.nav_msgs.Odometry import Odometry
 from dimos.msgs.tf2_msgs.TFMessage import TFMessage
+from dimos.msgs.vision_msgs.Detection2DArray import Detection2DArray
 from dimos.robot.px4.blueprints import px4_sitl
 from dimos.robot.px4.command_tracker import CommandTracker
 from dimos.robot.px4.connection import Px4DroneConnection
+from dimos.robot.px4.link_monitor import LinkMonitor
+from dimos.robot.px4.perception.bridge import PerceptionBridge
+from dimos.robot.px4.perception.tracker import MIN_HITS
 from dimos.robot.px4.sitl import FakeA8
 from dimos.robot.px4.supervisor_core import GOTO_ARRIVED
 
 _STAMP_BOUND_MS = 50.0
+_CONFIRM_WITHIN_FRAMES = MIN_HITS + 5
+_AZIMUTH_TOL_DEG = 2.0
 _GIMBAL_TOL_DEG = 3.0
 _CHAIN = {
     ("base_link", "gimbal_base"),
@@ -172,13 +182,19 @@ class _Taps:
         self.lock = threading.Lock()
         self.odom_stamps: list[tuple[float, float]] = []
         self.latest_odom_ts = 0.0
+        self.latest_odom_yaw_flu = math.nan
         self.edges: set[tuple[str, str]] = set()
         self.frame_lag_ms: list[float] = []
+        self.track_frames = 0
+        self.frames_until_track = -1
+        self.los_yaws: list[float] = []
+        self.policy: LinkPolicy | None = None
 
     def on_odom(self, msg: Odometry) -> None:
         with self.lock:
             self.odom_stamps.append((msg.ts, time.time()))
             self.latest_odom_ts = msg.ts
+            self.latest_odom_yaw_flu = msg.orientation.to_euler().z
 
     def on_tf(self, msg: TFMessage) -> None:
         with self.lock:
@@ -189,6 +205,20 @@ class _Taps:
         with self.lock:
             if self.latest_odom_ts:
                 self.frame_lag_ms.append((self.latest_odom_ts - msg.ts) * 1e3)
+
+    def on_tracks(self, msg: Detection2DArray) -> None:
+        with self.lock:
+            self.track_frames += 1
+            if msg.detections_length > 0 and self.frames_until_track < 0:
+                self.frames_until_track = self.track_frames
+
+    def on_los(self, msg: PoseStamped) -> None:
+        with self.lock:
+            self.los_yaws.append(msg.yaw)
+
+    def on_policy(self, msg: LinkPolicy) -> None:
+        with self.lock:
+            self.policy = msg
 
 
 def main() -> int:
@@ -209,13 +239,22 @@ def main() -> int:
             coordinator.transports[("odometry", Odometry)].subscribe(taps.on_odom),
             coordinator.transports[("tf", TFMessage)].subscribe(taps.on_tf),
             coordinator.transports[("video", CompressedVideo)].subscribe(taps.on_video),
+            coordinator.transports[("tracks", Detection2DArray)].subscribe(taps.on_tracks),
+            coordinator.transports[("target_los", PoseStamped)].subscribe(taps.on_los),
+            coordinator.transports[("link_policy", LinkPolicy)].subscribe(taps.on_policy),
         ]
         drone = coordinator.get_instance(Px4DroneConnection)
+        bridge = coordinator.get_instance(PerceptionBridge)
         gimbal = coordinator.get_instance(SiyiA8Gimbal)
         a8 = coordinator.get_instance(FakeA8)
+        link = coordinator.get_instance(LinkMonitor)
         tracker = coordinator.get_instance(CommandTracker)
 
         time.sleep(args.seconds)
+        # Select the synthetic target: from here the line of sight is valid and the gimbal
+        # module aims at it (through FakeA8, which is already pointing there).
+        print("select:", bridge.select_track(1))
+        time.sleep(2.0)
         for u in unsubs:
             u()
 
@@ -223,6 +262,10 @@ def main() -> int:
             samples = list(taps.odom_stamps)
             edges = set(taps.edges)
             lags = list(taps.frame_lag_ms)
+            first_track = taps.frames_until_track
+            los_yaws = list(taps.los_yaws)
+            veh_yaw_flu = taps.latest_odom_yaw_flu
+            policy = taps.policy
 
         # 1. Telemetry.
         stats = drone.sensor_stats()
@@ -246,13 +289,36 @@ def main() -> int:
             ok = False
         state = gimbal.state()
         reported, fake = state["attitude"], a8.attitude()
-        print(f"fake A8: {fake}  gimbal reports: {reported}")
-        ok &= reported is not None
+        print(f"aim requests: {state['aim_sent']}  fake A8: {fake}  gimbal reports: {reported}")
+        ok &= state["aim_sent"] > 0 and reported is not None
         if reported is not None:
             ok &= abs(_wrap(reported["yaw"] - fake["yaw"])) < _GIMBAL_TOL_DEG
             ok &= abs(reported["pitch"] - fake["pitch"]) < _GIMBAL_TOL_DEG
 
-        # 3. The operator flight, scored by the tracker.
+        # 3. Perception.
+        print(f"track confirmed after {first_track} frames (limit {_CONFIRM_WITHIN_FRAMES})")
+        ok &= 0 < first_track <= _CONFIRM_WITHIN_FRAMES
+        status = bridge.status()
+        print("target:", status["target"])
+        ok &= bool(status["target"] and status["target"]["valid"])
+        if los_yaws and not math.isnan(veh_yaw_flu):
+            # LOS pose yaw is the gimbal body yaw as an FLU angle; azimuth = heading + gimbal yaw.
+            azimuth = (-math.degrees(veh_yaw_flu) - math.degrees(los_yaws[-1])) % 360.0
+            expected = (-math.degrees(veh_yaw_flu) + fake["yaw"]) % 360.0
+            err = abs(_wrap(azimuth - expected))
+            print(
+                f"azimuth from target_los {azimuth:.2f} vs gimbal+heading {expected:.2f}: err {err:.2f}"
+            )
+            ok &= err <= _AZIMUTH_TOL_DEG
+        else:
+            print("no target_los received")
+            ok = False
+
+        # 4. Link.
+        print("link:", link.path(), "policy:", None if policy is None else policy.reason)
+        ok &= policy is not None and policy.video_allowed
+
+        # 5. The operator flight, scored by the tracker.
         if args.fly:
             ok &= _fly(coordinator, drone, tracker)
         print("camera stats:", coordinator.get_instance("rtspcamera").sensor_stats())
