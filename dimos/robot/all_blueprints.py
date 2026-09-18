@@ -262,6 +262,7 @@ all_modules = {
     "keyboard-teleop": "dimos.robot.unitree.keyboard_teleop.KeyboardTeleop",
     "keyboard-teleop-module": "dimos.teleop.keyboard.keyboard_teleop_module.KeyboardTeleopModule",
     "lidar-window-relocalization": "dimos.mapping.relocalization.lidar.module.LidarWindowRelocalization",
+    "link-monitor": "dimos.robot.px4.link_monitor.LinkMonitor",
     "local-map-relocalization": "dimos.mapping.relocalization.lidar.module.LocalMapRelocalization",
     "m20-camera-relay": "dimos.robot.deeprobotics.m20.camera.M20CameraRelay",
     "m20-connection": "dimos.robot.deeprobotics.m20.connection.M20Connection",
