@@ -22,6 +22,7 @@ Everything else is a separate module that reads or feeds the connection's stream
 | `PerceptionBridge` | no | detector, tracker, line of sight, target position | color_image, odometry, gimbal_attitude, global_pose, vehicle_status, track_select | tracks, target_state, target_valid, target_los |
 | `LinkMonitor` | no | 5G link quality and the video/telemetry policy | nothing | link_status, link_policy |
 | `CommandTracker` | no | scores every operator command: did it take effect, if not why | command_event, offboard_setpoint, odometry, vehicle_status, supervisor_state | tracked_command, command_report, cmd_forward, meas_forward |
+| `Px4SkillContainer` | no | the flight commands as agent skills, each waiting for its outcome | nothing (calls the connection's RPCs) | nothing |
 | `FakeA8` | SITL only | stands in for the gimbal hardware | gimbal_target | gimbal_attitude |
 
 A missing optional module never stops anything from starting. You lose what it provided:
@@ -41,11 +42,14 @@ dimos/robot/px4/
   mavlink.py           MAVLink layer: PX4 modes, NED/FLU frames, timebase, vehicle state, the socket
   supervisor_core.py   flight state machine and guidance laws, pure logic, no socket
   connection.py        Px4DroneConnection, the module
+  connection_spec.py   the connection RPCs the skills call
+  skill_container.py   Px4SkillContainer and the agent's system prompt
   command_tracker.py   CommandTracker
   link_monitor.py      LinkMonitor
   perception/          PerceptionBridge (bridge.py) plus detector, tracker, geometry, estimators
   sitl.py              FakeA8
   blueprints.py        px4-basic, px4-drone, px4-sitl, px4-teleop, px4-sitl-teleop
+  blueprints_agentic.py  px4-agentic, px4-sitl-agentic (needs the `agents` extra)
   tool_*_gate.py       gates, print PASS or FAIL with numbers
 dimos/hardware/sensors/camera/rtsp/   RtspCamera
 dimos/hardware/gimbal/siyi/           SiyiA8Gimbal, frame maths, SIYI SDK
@@ -58,10 +62,11 @@ dimos/msgs/px4_msgs/, dimos/msgs/link_msgs/   typed messages
 dimos run px4-basic    # connection + viewer, on the Jetson
 dimos run px4-drone    # everything on the aircraft
 dimos run px4-teleop   # px4-drone + the viewer's keyboard
+dimos run px4-agentic  # px4-teleop + the skills, the MCP server and the LLM agent
 dimos run px4-sitl     # px4-drone against PX4 SITL, with synthetic camera, fake gimbal, replayed link
 ```
 
-`px4-sitl` and `px4-sitl-teleop` need `make px4_sitl gz_x500` running in
+`px4-sitl`, `px4-sitl-teleop` and `px4-sitl-agentic` need `make px4_sitl gz_x500` running in
 a PX4 tree, and a ground station on 14550 (QGC) or PX4 refuses to arm. Each module also runs
 alone (`dimos run px4-drone-connection`, `command-tracker`, `rtsp-camera`, `siyi-a8-gimbal`,
 `link-monitor`, `perception-bridge`, `fake-a8`) and binds to whatever else is running.
@@ -101,6 +106,21 @@ click the keyboard overlay in the viewer and fly: W/S forward and back, Q/E stra
 turn, Shift faster, Space stop. Keys do nothing outside TELEOP (the tracker shows them as
 `rejected/not_teleop`), speeds are clamped to the teleop limits, the altitude stays where
 TELEOP started, and when the keys stop arriving the vehicle holds position.
+
+### Agent
+
+`px4-agentic` adds `Px4SkillContainer` (takeoff, go_to, land, set_guidance_mode,
+flight_status), the MCP server and the LLM agent, so the same commands work in words.
+It needs `uv sync --extra agents` and `OPENAI_API_KEY`:
+
+```bash
+dimos agent-send "take off to 2 meters"
+dimos agent-send "go to 2 meters south at 3 m altitude"
+dimos mcp call go_to --arg north_m=-2 --arg altitude_m=3    # the same skill, no LLM
+```
+
+A skill is a connection RPC plus a wait for the outcome. It adds no authority: the
+supervisor refuses a skill exactly as it refuses the RPC.
 
 ## Test
 
