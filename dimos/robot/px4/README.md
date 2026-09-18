@@ -23,9 +23,12 @@ outdoors yet.
 | `CommandTracker` | Scores each command: did the vehicle do it, how late | command_event, offboard_setpoint, odometry, vehicle_status, supervisor_state | tracked_command, command_report, cmd_forward, meas_forward |
 | `RtspCamera` | H.265 stream in; passthrough video, decoded frames, small JPEG out | link_policy | video, color_image, color_jpeg |
 | `SiyiA8Gimbal` | Gimbal tf chain, camera intrinsics, aim requests | gimbal_attitude, target_los | tf, camera_info, gimbal_target |
+| `LinkMonitor` | Measures the operator link, sets video and telemetry rates | none | link_status, link_policy |
+| `PerceptionBridge` | Detector, tracker, line of sight, target position | color_image, odometry, gimbal_attitude, global_pose, vehicle_status, track_select | tracks, target_state, target_valid, target_los |
 | `FakeA8` | SITL only: answers as the gimbal | gimbal_target | gimbal_attitude |
 
-`YAW_TRACK` and `FOLLOW` need a target on `target_state`. Without one they hold position.
+`YAW_TRACK` and `FOLLOW` need the target from `PerceptionBridge`, which needs the camera.
+Without a target they hold position.
 
 ## Files
 
@@ -36,12 +39,14 @@ dimos/robot/px4/
   supervisor_core.py     flight state machine and guidance laws; no I/O
   connection.py          Px4DroneConnection
   command_tracker.py     CommandTracker
+  link_monitor.py        LinkMonitor
+  perception/            PerceptionBridge: detector, tracker, geometry, estimators
   sitl.py                FakeA8
   blueprints.py          px4-basic, px4-drone, px4-sitl, px4-teleop, px4-sitl-teleop
   tool_*_gate.py         gates: print the numbers, end with GATE PASS or GATE FAIL
 dimos/hardware/sensors/camera/rtsp/   RtspCamera
 dimos/hardware/gimbal/siyi/           SiyiA8Gimbal, frame maths, SIYI SDK
-dimos/msgs/px4_msgs/                  VehicleStatus, CommandEvent, TrackedCommand
+dimos/msgs/px4_msgs/, link_msgs/      typed messages
 ```
 
 ## Install
@@ -55,9 +60,9 @@ uv sync --extra px4
 | Blueprint | Runs |
 |---|---|
 | `px4-basic` | connection, viewer |
-| `px4-drone` | connection, tracker, camera, gimbal, viewer |
+| `px4-drone` | connection, tracker, camera, gimbal, link monitor, perception, viewer |
 | `px4-teleop` | `px4-drone` with the viewer's keyboard on `cmd_vel` |
-| `px4-sitl`, `px4-sitl-teleop` | the same against PX4 SITL: synthetic camera, fake gimbal |
+| `px4-sitl`, `px4-sitl-teleop` | the same against PX4 SITL: synthetic camera, fake gimbal, replayed link |
 
 ```bash
 dimos run px4-drone
@@ -68,7 +73,8 @@ dimos --rerun-open none --rerun-host 0.0.0.0 run px4-drone   # on the aircraft, 
 With the last form, run the `dimos-viewer --connect ...` line it logs on the laptop.
 
 Each module also runs alone and binds to whatever else is running:
-`dimos run px4-drone-connection`, `command-tracker`, `rtsp-camera`, `siyi-a8-gimbal`, `fake-a8`.
+`dimos run px4-drone-connection`, `command-tracker`, `rtsp-camera`, `siyi-a8-gimbal`,
+`link-monitor`, `perception-bridge`, `fake-a8`.
 
 ## Commands
 
@@ -85,6 +91,8 @@ drone.land()
 drone.estop()                                # Hold and latch; estop_clear() works in IDLE
 drone.status()
 app.CommandTracker.recent()
+app.PerceptionBridge.select_track(1)
+app.LinkMonitor.status()
 ```
 
 - Every command returns `{"accepted": bool, "rejection": str | None, "state": str}`.
@@ -121,6 +129,7 @@ uv run pytest dimos/robot/px4 dimos/hardware/gimbal/siyi dimos/hardware/sensors/
 
 ```bash
 uv run python dimos/robot/px4/tool_tracker_gate.py    # scripted commands through zenoh
+uv run python dimos/robot/px4/tool_link_gate.py       # recorded link scenarios
 ```
 
 Each ends with `GATE PASS`.
@@ -139,6 +148,9 @@ It runs `px4-sitl` and checks:
 - odometry at 25 Hz or more, stamps within 50 ms
 - the gimbal chain in `tf`, the gimbal module reporting the fake A8's attitude
 - video frames stamped within 50 ms of the vehicle clock
+- a track confirmed, a valid target after selection, line of sight within 2 deg
+- the gimbal aimed at the target
+- the link policy allows video
 - the flight: takeoff to 2 m, go 2 m south at 3 m, a go-to past the fence refused, a held
   key moving the vehicle at a locked altitude, land
 - the tracker scoring each of those commands

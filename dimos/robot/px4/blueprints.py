@@ -18,10 +18,11 @@
     Px4DroneConnection plus the viewer. On the Jetson against mavlink-router endpoint 14556.
 ``px4-drone``
     Everything on the aircraft: the connection, the command tracker, the A8 camera and
-    gimbal.
+    gimbal, the link monitor and the perception bridge.
 ``px4-sitl``
     The same modules against PX4 SITL (``make px4_sitl gz_x500``). What the simulator lacks
-    is stood in for: the camera replays a generated clip, FakeA8 answers as the gimbal.
+    is stood in for: the camera replays a generated clip, FakeA8 answers as the gimbal, the
+    link monitor replays a measured scenario, the perception bridge runs the blob detector.
     ``tool_sitl_gate.py`` runs this blueprint end to end.
 ``px4-teleop``, ``px4-sitl-teleop``
     The aircraft and its twin with the viewer's keyboard on ``cmd_vel``, the way
@@ -29,8 +30,9 @@
 
 Every module except the connection is optional. Each binds to the others by stream name and
 type, and each is written to degrade when a peer is absent (no gimbal attitude means no
-gimbal tf, no target means the connection never leaves HOVER for FOLLOW), so removing a
-module from a blueprint removes a capability, never a startup.
+gimbal tf and no line of sight, no link monitor means the camera keeps its own defaults,
+no perception means the connection never leaves HOVER for FOLLOW), so removing a module
+from a blueprint removes a capability, never a startup.
 
 Layout mirrors ``r1pro_coordinator.py``: one function per layer returning a Blueprint,
 composed with ``autoconnect``. All streams of the package are declared once in
@@ -50,8 +52,11 @@ from dimos.core.transport import ZenohTransport
 from dimos.hardware.gimbal.siyi.gimbal import SiyiA8Gimbal
 from dimos.hardware.sensors.camera.rtsp.camera import SYNTHETIC_URL, RtspCamera
 from dimos.msgs.foxglove_msgs.CompressedVideo import CompressedVideo
+from dimos.msgs.geometry_msgs.PointStamped import PointStamped
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Twist import Twist
+from dimos.msgs.link_msgs.LinkPolicy import LinkPolicy
+from dimos.msgs.link_msgs.LinkStatus import LinkStatus
 from dimos.msgs.nav_msgs.Odometry import Odometry
 from dimos.msgs.px4_msgs.CommandEvent import CommandEvent
 from dimos.msgs.px4_msgs.TrackedCommand import TrackedCommand
@@ -66,10 +71,13 @@ from dimos.msgs.sensor_msgs.NavSatFix import NavSatFix
 from dimos.msgs.std_msgs.Float32 import Float32
 from dimos.msgs.std_msgs.String import String
 from dimos.msgs.tf2_msgs.TFMessage import TFMessage
+from dimos.msgs.vision_msgs.Detection2DArray import Detection2DArray
 from dimos.protocol.pubsub.impl.zenohpubsub import QOS_LATEST_WINS, Topic as ZenohTopic, Zenoh
 from dimos.robot.px4.command_tracker import CommandTracker
 from dimos.robot.px4.config import SITL_MAV_URL
 from dimos.robot.px4.connection import Px4DroneConnection
+from dimos.robot.px4.link_monitor import LinkMonitor
+from dimos.robot.px4.perception.bridge import PerceptionBridge
 from dimos.robot.px4.sitl import FakeA8
 from dimos.visualization.rerun.bridge import RerunBridgeModule
 from dimos.visualization.rerun.websocket_server import RerunWebSocketServer
@@ -126,11 +134,19 @@ def px4_transports() -> dict[tuple[str, type], TransportSpec | Transport[Any]]:
             "color_jpeg", CompressedImage, latest_wins=True
         ),
         ("camera_info", CameraInfo): _zenoh_transport("camera_info", CameraInfo),
+        # Link monitor.
+        ("link_status", LinkStatus): _zenoh_transport("link_status", LinkStatus),
+        ("link_policy", LinkPolicy): _zenoh_transport("link_policy", LinkPolicy),
         # Command tracker.
         ("tracked_command", TrackedCommand): _zenoh_transport("tracked_command", TrackedCommand),
         ("command_report", String): _zenoh_transport("command_report", String),
         ("cmd_forward", Float32): _zenoh_transport("cmd_forward", Float32),
         ("meas_forward", Float32): _zenoh_transport("meas_forward", Float32),
+        # Perception.
+        ("tracks", Detection2DArray): _zenoh_transport(
+            "tracks", Detection2DArray, latest_wins=True
+        ),
+        ("track_select", PointStamped): _zenoh_transport("track_select", PointStamped),
     }
 
 
@@ -179,6 +195,7 @@ _RERUN_MAX_HZ = {
     "world/tf": 10.0,
     "world/imu": 5.0,
     "world/motor_outputs": 5.0,
+    "world/tracks": 10.0,
     "world/gimbal_attitude": 10.0,
 }
 # Suppressed entirely: raw decoded frames are the heaviest payload on the viewer link, and
@@ -237,12 +254,16 @@ px4_drone = (
         CommandTracker.blueprint(),
         RtspCamera.blueprint(),
         SiyiA8Gimbal.blueprint(),
+        LinkMonitor.blueprint(),
+        PerceptionBridge.blueprint(),
     )
     .transports(px4_transports())
     .global_config(transport="zenoh", n_workers=2)
 )
 
-# The fake A8 starts 20 deg down and 30 deg right so the gimbal tf chain is non-trivial.
+# The aircraft on the ground gives no altitude, so the estimator uses a fixed 10 m AGL the
+# way the flown bench runs did; the fake A8 starts 20 deg down and 30 deg right so the
+# synthetic target (parked at the image centre) has a non-trivial line of sight.
 px4_sitl = (
     autoconnect(
         px4_visualization(),
@@ -251,6 +272,10 @@ px4_sitl = (
         RtspCamera.blueprint(url=SYNTHETIC_URL, color_hz=25.0),
         SiyiA8Gimbal.blueprint(aim_enabled=True),
         FakeA8.blueprint(initial_pitch_deg=-20.0, initial_yaw_deg=30.0),
+        LinkMonitor.blueprint(source="replay", replay_scenario="home_5g"),
+        PerceptionBridge.blueprint(
+            detector="blob", estimator={"agl_source": "fixed", "fixed_agl_m": 10.0}
+        ),
     )
     .transports(px4_transports())
     .global_config(transport="zenoh", n_workers=2)
