@@ -25,6 +25,7 @@ outdoors yet.
 | `SiyiA8Gimbal` | Gimbal tf chain, camera intrinsics, aim requests | gimbal_attitude, target_los | tf, camera_info, gimbal_target |
 | `LinkMonitor` | Measures the operator link, sets video and telemetry rates | none | link_status, link_policy |
 | `PerceptionBridge` | Detector, tracker, line of sight, target position | color_image, odometry, gimbal_attitude, global_pose, vehicle_status, track_select | tracks, target_state, target_valid, target_los |
+| `Px4SkillContainer` | The flight commands as agent skills | none (calls the connection's RPCs) | none |
 | `FakeA8` | SITL only: answers as the gimbal | gimbal_target | gimbal_attitude |
 
 `YAW_TRACK` and `FOLLOW` need the target from `PerceptionBridge`, which needs the camera.
@@ -41,8 +42,11 @@ dimos/robot/px4/
   command_tracker.py     CommandTracker
   link_monitor.py        LinkMonitor
   perception/            PerceptionBridge: detector, tracker, geometry, estimators
+  skill_container.py     Px4SkillContainer and the agent's system prompt
+  connection_spec.py     the connection RPCs the skills call
   sitl.py                FakeA8
   blueprints.py          px4-basic, px4-drone, px4-sitl, px4-teleop, px4-sitl-teleop
+  blueprints_agentic.py  px4-agentic, px4-sitl-agentic
   tool_*_gate.py         gates: print the numbers, end with GATE PASS or GATE FAIL
 dimos/hardware/sensors/camera/rtsp/   RtspCamera
 dimos/hardware/gimbal/siyi/           SiyiA8Gimbal, frame maths, SIYI SDK
@@ -53,6 +57,7 @@ dimos/msgs/px4_msgs/, link_msgs/      typed messages
 
 ```bash
 uv sync --extra px4
+uv sync --extra px4 --extra agents    # for px4-agentic
 ```
 
 ## Run
@@ -62,7 +67,8 @@ uv sync --extra px4
 | `px4-basic` | connection, viewer |
 | `px4-drone` | connection, tracker, camera, gimbal, link monitor, perception, viewer |
 | `px4-teleop` | `px4-drone` with the viewer's keyboard on `cmd_vel` |
-| `px4-sitl`, `px4-sitl-teleop` | the same against PX4 SITL: synthetic camera, fake gimbal, replayed link |
+| `px4-agentic` | `px4-teleop` with the skills, the MCP server and the LLM agent |
+| `px4-sitl`, `px4-sitl-teleop`, `px4-sitl-agentic` | the same against PX4 SITL: synthetic camera, fake gimbal, replayed link |
 
 ```bash
 dimos run px4-drone
@@ -112,6 +118,22 @@ app.LinkMonitor.status()
 
 Keys are ignored outside `TELEOP`. Speeds are clamped to 1.5 m/s and 0.8 rad/s. Altitude
 stays where `TELEOP` began. When keys stop for 0.5 s the vehicle holds position.
+
+## Agent
+
+1. `uv sync --extra px4 --extra agents` and set `OPENAI_API_KEY`.
+2. `dimos run px4-agentic` (or `px4-sitl-agentic`).
+3. Send commands:
+
+```bash
+dimos agent-send "take off to 2 meters"
+dimos agent-send "go to 2 meters south at 3 m altitude"
+dimos mcp call go_to --arg north_m=-2 --arg altitude_m=3    # the same skill, no LLM
+```
+
+Skills: `takeoff`, `go_to`, `land`, `set_guidance_mode`, `flight_status`. A skill is the
+connection RPC plus a wait for the outcome. The supervisor refuses a skill exactly as it
+refuses the RPC.
 
 ## Test
 
