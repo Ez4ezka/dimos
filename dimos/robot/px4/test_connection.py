@@ -24,12 +24,22 @@ from collections.abc import Iterator
 import math
 import socket
 import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
 
+from dimos.msgs.px4_msgs.CommandEvent import CommandEvent
 from dimos.msgs.sensor_msgs.JointState import JointState
 from dimos.robot.px4.connection import Px4DroneConnection
+from dimos.robot.px4.mavlink import (
+    MAIN_OFFBOARD,
+    MAIN_POSCTL,
+    Heartbeat,
+    LocalPosition,
+    VehicleSnapshot,
+)
+from dimos.robot.px4.supervisor_core import GotoGoal, SupervisorCore, TakeoffPoint
 
 # The port contract (Round 1). New modules bind by exact name; renaming one breaks them.
 _CONTRACT_OUT = {
@@ -74,6 +84,7 @@ _FORBIDDEN_RPCS = {
 }
 _REQUIRED_RPCS = {
     "takeoff",
+    "go_to",
     "land",
     "hold",
     "set_guidance_mode",
@@ -143,6 +154,77 @@ def test_stop_joins_tick_before_heartbeat_before_publish_then_closes_io(
         "writer-lock",
     ]
     assert all(not t.is_alive() for _, t in threads)
+
+
+def _snapshot(d: float = 0.0, flying: bool = False) -> VehicleSnapshot:
+    now = time.time()
+    main = MAIN_OFFBOARD if flying else MAIN_POSCTL
+    return VehicleSnapshot(
+        wall=now,
+        heartbeat=Heartbeat(flying, main << 16, main, 0, now),
+        heartbeat_age=0.0,
+        local=LocalPosition(0.0, 0.0, d, 0.0, 0.0, 0.0, None, now),
+        local_age=0.0,
+        gps=None,
+        sys_status=None,
+        rc=None,
+        rc_age=math.inf,
+        landed_state=None,
+        yaw_deg=0.0,
+        px4_msg_age=0.0,
+    )
+
+
+@pytest.fixture
+def commanded(module: Px4DroneConnection) -> tuple[Px4DroneConnection, list[CommandEvent]]:
+    """The module with a supervisor core and a vehicle snapshot but no socket, and its events."""
+    module._core = SupervisorCore(module.config.limits, module.config.guidance)
+    module._io = MagicMock()
+    module._state = MagicMock()
+    module._state.snapshot.return_value = _snapshot()
+    events: list[CommandEvent] = []
+    module.command_event.subscribe(events.append)
+    return module, events
+
+
+def test_takeoff_rpc_passes_the_altitude_to_the_core(
+    commanded: tuple[Px4DroneConnection, list[CommandEvent]],
+) -> None:
+    module, events = commanded
+    assert module.takeoff(2.5) == {"accepted": True, "rejection": None, "state": "PREFLIGHT"}
+    assert module._core is not None and module._core.takeoff_alt_m == 2.5
+    assert module.takeoff(2.0) == {
+        "accepted": False,
+        "rejection": "wrong_state",
+        "state": "PREFLIGHT",
+    }
+    assert [(e.command, e.argument, e.accepted) for e in events] == [
+        ("takeoff", "2.50", True),
+        ("takeoff", "2.00", False),
+    ]
+
+
+def test_go_to_rpc_sets_the_goal_and_a_refusal_leaves_it_running(
+    commanded: tuple[Px4DroneConnection, list[CommandEvent]],
+) -> None:
+    module, events = commanded
+    core = module._core
+    assert core is not None
+    core.state, core.takeoff = "HOVER", TakeoffPoint(n=0.0, e=0.0, d0=0.0, yaw=0.0)
+    module._state.snapshot.return_value = _snapshot(d=-2.0, flying=True)
+
+    assert module.go_to(north_m=-2.0, altitude_m=3.0)["accepted"]
+    assert core.state == "GOTO" and core.goal == GotoGoal(n=-2.0, e=0.0, d=-3.0)
+    assert module.go_to(north_m=100.0) == {
+        "accepted": False,
+        "rejection": "fence",
+        "state": "GOTO",
+    }
+    assert core.goal == GotoGoal(n=-2.0, e=0.0, d=-3.0)
+    assert [(e.command, e.argument, e.accepted, e.rejection) for e in events] == [
+        ("go_to", "-2.00,0.00,3.00,nan,1", True, ""),
+        ("go_to", "100.00,0.00,nan,nan,1", False, "fence"),
+    ]
 
 
 def _target(pitch_deg: float, yaw_deg: float) -> JointState:

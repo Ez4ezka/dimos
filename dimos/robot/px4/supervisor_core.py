@@ -18,6 +18,7 @@ States::
 
   IDLE -> PREFLIGHT -> STREAMING -> OFFBOARD_REQ -> ARMING -> TAKEOFF -> HOVER
   HOVER <-> YAW_TRACK / FOLLOW / TELEOP       (operator selects the guidance mode)
+  any guidance state -> GOTO -> HOVER         (operator go-to; ends hovering at the goal)
   any armed state -> LANDING -> IDLE          (operator land)
   any armed state -> ABORT -> IDLE            (safety rule: PX4 put in Hold, setpoints stop)
   pilot leaves Offboard -> IDLE               (PILOT_OVERRIDE: we never touch the mode)
@@ -37,19 +38,28 @@ commands from raw pixel error.
 
 Ported from drone-autonomy ``flight_supervisor.py:43-303`` and ``common/guidance.py``
 (flown 2026-09-09), maths unchanged. Additions over the flown code: the TELEOP guidance
-mode, the E-STOP latch, the closed rejection enum, and ``set_hold``/``set_land`` gated on
-PX4 being in OFFBOARD (safety invariant 1).
+mode, the E-STOP latch, the closed rejection enum, ``set_hold``/``set_land`` gated on
+PX4 being in OFFBOARD (safety invariant 1), and the operator's takeoff altitude and
+go-to (the GOTO state), both checked against the ceiling and the fence before they move
+anything.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 import enum
 import math
 import time
 from typing import Any, Literal, Protocol
 
-from dimos.robot.px4.config import FollowConfig, GuidanceConfig, SupervisorLimits, YawTrackConfig
+from dimos.robot.px4.config import (
+    FollowConfig,
+    GotoConfig,
+    GuidanceConfig,
+    SupervisorLimits,
+    YawTrackConfig,
+)
 from dimos.robot.px4.mavlink import (
     LANDED_ON_GROUND,
     MAIN_AUTO,
@@ -62,8 +72,14 @@ from dimos.robot.px4.mavlink import (
 )
 from dimos.utils.angles import clamp, wrap180
 
-ARMED_STATES = frozenset({"ARMING", "TAKEOFF", "HOVER", "YAW_TRACK", "FOLLOW", "TELEOP", "LANDING"})
-GUIDANCE_STATES = frozenset({"HOVER", "YAW_TRACK", "FOLLOW", "TELEOP"})
+# GOTO is a guidance state but not a selectable mode: it needs a goal, so only goto_cmd
+# enters it.
+GUIDANCE_STATES = frozenset({"HOVER", "YAW_TRACK", "FOLLOW", "TELEOP", "GOTO"})
+ARMED_STATES = GUIDANCE_STATES | {"ARMING", "TAKEOFF", "LANDING"}
+# From an accepted takeoff to the hover; any other state after it means it failed.
+TAKEOFF_STATES = frozenset({"PREFLIGHT", "STREAMING", "OFFBOARD_REQ", "ARMING", "TAKEOFF"})
+# The HOVER reason that tells a finished go-to from an interrupted or timed-out one.
+GOTO_ARRIVED = "arrived at the go-to goal"
 GuidanceMode = Literal["HOVER", "YAW_TRACK", "FOLLOW", "TELEOP"]
 GUIDANCE_MODES: tuple[GuidanceMode, ...] = ("HOVER", "YAW_TRACK", "FOLLOW", "TELEOP")
 
@@ -87,9 +103,10 @@ class Rejection(enum.Enum):
     CEILING = "ceiling"
     BATTERY = "battery"
     # A command that makes no sense in the current state
-    # (takeoff while flying, estop_clear while not IDLE). The tracker treats it as a
-    # plain refusal.
+    # (takeoff while flying, estop_clear while not IDLE), or whose numbers are unusable
+    # (an altitude under min_alt_m, a NaN). The tracker treats both as a plain refusal.
     WRONG_STATE = "wrong_state"
+    INVALID_ARGUMENT = "invalid_argument"
 
 
 @dataclass(frozen=True)
@@ -107,6 +124,16 @@ class HoverPoint:
     n: float
     e: float
     d: float
+
+
+@dataclass(frozen=True)
+class GotoGoal:
+    """Where GOTO flies to, local NED. ``yaw`` None keeps the heading the vehicle has."""
+
+    n: float
+    e: float
+    d: float
+    yaw: float | None = None  # degrees, NED heading
 
 
 @dataclass(frozen=True)
@@ -225,6 +252,22 @@ def rate_limit_yaw(current_deg: float, desired_deg: float, max_rate_dps: float, 
     return wrap180(current_deg + step)
 
 
+def goto_velocity(
+    veh_n: float, veh_e: float, veh_d: float, goal: GotoGoal, cfg: GotoConfig
+) -> tuple[float, float, float]:
+    """NED velocity toward the goal: proportional to the distance left, capped per axis.
+
+    The cap is ours, not PX4's: a far position setpoint would be flown at whatever
+    MPC_XY_VEL_MAX happens to be set on the vehicle.
+    """
+    dn, de = goal.n - veh_n, goal.e - veh_e
+    rng = math.hypot(dn, de)
+    speed = min(cfg.k_pos * rng, cfg.v_max_mps)
+    vn, ve = (speed * dn / rng, speed * de / rng) if rng > 1e-3 else (0.0, 0.0)
+    vd = clamp(cfg.k_alt * (goal.d - veh_d), -cfg.vz_max_mps, cfg.vz_max_mps)
+    return vn, ve, vd
+
+
 class Px4Actuator(Protocol):
     """The only way the core touches the aircraft."""
 
@@ -265,13 +308,16 @@ class SupervisorCore:
         self.sp: Setpoint | None = None
         self.yaw_cmd: float = 0.0
         self.takeoff: TakeoffPoint | None = None
+        self.takeoff_alt_m = limits.takeoff_alt_m
         self.hover: HoverPoint | None = None
+        self.goal: GotoGoal | None = None
         self.entered_offboard = False
         self.last_sp = 0.0
         self.last_step: float | None = None
         self.estop_latched = False
         self.last_rejection: Rejection | None = None
         self.teleop: TeleopCommand | None = None
+        self.teleop_d: float | None = None
         self.setpoint_count = 0
         self.transitions: list[tuple[str, str, float]] = []
 
@@ -279,6 +325,7 @@ class SupervisorCore:
         t = time.time() if now is None else now
         if state != self.state:
             self.transitions.append((state, reason, t))
+            self.teleop_d = None  # the next stay in TELEOP locks its own altitude
         self.state, self.state_since, self.reason = state, t, reason
 
     def enable_switch(self, st: VehicleSnapshot) -> bool:
@@ -368,12 +415,78 @@ class SupervisorCore:
         self.fake_enable = bool(value)
         return None
 
-    def takeoff_cmd(self, st: VehicleSnapshot, now: float | None = None) -> Rejection | None:
+    def _altitude_rejection(self, alt_m: float) -> Rejection | None:
+        """Why an operator altitude (above the takeoff point) is unusable, or None."""
+        c = self.cfg
+        if not math.isfinite(alt_m) or alt_m < c.min_alt_m:
+            return Rejection.INVALID_ARGUMENT
+        if alt_m > c.max_alt_m - c.goal_margin_m:
+            return Rejection.CEILING
+        return None
+
+    def takeoff_cmd(
+        self, st: VehicleSnapshot, now: float | None = None, alt_m: float | None = None
+    ) -> Rejection | None:
+        """Take off to ``alt_m`` above the ground, or to the configured altitude when None."""
         if self.estop_latched:
             return self._reject(Rejection.ESTOP_LATCHED)
         if self.state != "IDLE":
             return self._reject(Rejection.WRONG_STATE)
-        self.goto("PREFLIGHT", "operator takeoff", now)
+        alt = self.cfg.takeoff_alt_m if alt_m is None else alt_m
+        why = self._altitude_rejection(alt)
+        if why is not None:
+            return self._reject(why)
+        self.takeoff_alt_m = alt
+        self.goto("PREFLIGHT", f"operator takeoff to {alt:.1f} m", now)
+        return None
+
+    def goto_cmd(
+        self,
+        st: VehicleSnapshot,
+        north_m: float,
+        east_m: float,
+        alt_m: float | None = None,
+        heading_deg: float | None = None,
+        relative: bool = True,
+        now: float | None = None,
+    ) -> Rejection | None:
+        """Fly to a point and hover there. Accepted only while flying in a guidance state.
+
+        ``north_m``/``east_m`` count from where the vehicle is (``relative``) or from the
+        takeoff point; ``alt_m`` is above the takeoff point and ``heading_deg`` is a compass
+        heading, both kept as they are when None. The goal must sit ``goal_margin_m``
+        inside the fence and the ceiling.
+        """
+        if self.estop_latched:
+            return self._reject(Rejection.ESTOP_LATCHED)
+        if self.state not in GUIDANCE_STATES:
+            flying = self.state in ARMED_STATES
+            return self._reject(Rejection.WRONG_STATE if flying else Rejection.NOT_ARMED)
+        if st.local is None or self.takeoff is None:
+            return self._reject(Rejection.STALE_INPUT)
+        heading = 0.0 if heading_deg is None else heading_deg
+        if not all(math.isfinite(v) for v in (north_m, east_m, heading)):
+            return self._reject(Rejection.INVALID_ARGUMENT)
+        if alt_m is not None:
+            why = self._altitude_rejection(alt_m)
+            if why is not None:
+                return self._reject(why)
+        origin = st.local if relative else self.takeoff
+        n, e = origin.n + north_m, origin.e + east_m
+        north, east = n - self.takeoff.n, e - self.takeoff.e
+        if math.hypot(north, east) > self.cfg.geofence_radius_m - self.cfg.goal_margin_m:
+            return self._reject(Rejection.FENCE)
+        self.goal = GotoGoal(
+            n=n,
+            e=e,
+            d=st.local.d if alt_m is None else self.takeoff.d0 - alt_m,
+            yaw=None if heading_deg is None else wrap180(heading_deg),
+        )
+        # GOTO ends in HOVER at the goal, whatever mode it interrupted.
+        self.guidance_mode = "HOVER"
+        self.hover = None
+        self.teleop = None
+        self.goto("GOTO", f"go to {north:+.1f} m north, {east:+.1f} m east of takeoff", now)
         return None
 
     def land_cmd(
@@ -511,7 +624,8 @@ class SupervisorCore:
                         else Rejection.PREFLIGHT_FAILED
                     )
                     self.goto("IDLE", "preflight failed: " + ", ".join(fails), now)
-                self.reason = "waiting: " + ", ".join(fails)
+                else:
+                    self.reason = "waiting: " + ", ".join(fails)
             else:
                 assert st.local is not None
                 self.takeoff = TakeoffPoint(
@@ -557,7 +671,7 @@ class SupervisorCore:
                 self.goto("IDLE", "arming refused" + self._px4_said(st, "see QGC messages"), now)
         elif s == "TAKEOFF":
             assert self.takeoff is not None
-            d_goal = self.takeoff.d0 - self.cfg.takeoff_alt_m
+            d_goal = self.takeoff.d0 - self.takeoff_alt_m
             d_ramp = self.takeoff.d0 - self.cfg.climb_rate_mps * (now - self.state_since)
             self.sp = Setpoint(
                 kind="pos",
@@ -572,7 +686,7 @@ class SupervisorCore:
                 and d_ramp <= d_goal
             ):
                 self.hover = HoverPoint(n=self.takeoff.n, e=self.takeoff.e, d=d_goal)
-                self.goto("HOVER", f"at {self.cfg.takeoff_alt_m} m", now)
+                self.goto("HOVER", f"at {self.takeoff_alt_m} m", now)
         elif s == "HOVER":
             self.hover = self.hover or self._here(st)
             self.sp = Setpoint(
@@ -604,6 +718,8 @@ class SupervisorCore:
             self._step_follow(st, now, dt)
         elif s == "TELEOP":
             self._step_teleop(st, now)
+        elif s == "GOTO":
+            self._step_goto(st, now, dt)
         elif s == "LANDING":
             self.sp = None
             if st.landed_state == LANDED_ON_GROUND and not armed:
@@ -651,13 +767,21 @@ class SupervisorCore:
             self.goto("HOVER", "mode change", now)
 
     def _step_teleop(self, st: VehicleSnapshot, now: float) -> None:
+        c, here = self.cfg, self._here(st)
+        if self.teleop_d is None:
+            self.teleop_d = self.hover.d if self.hover is not None else here.d
         cmd = self.teleop
-        moving = cmd is not None and now - cmd.t <= self.cfg.teleop_stale_s and not cmd.is_zero
+        moving = cmd is not None and now - cmd.t <= c.teleop_stale_s and not cmd.is_zero
         if moving:
             assert cmd is not None
             yaw_rad = math.radians(st.yaw_deg if st.yaw_deg is not None else self.yaw_cmd)
-            up = 0.0 if self.cfg.teleop_lock_altitude else cmd.up
-            vn, ve, vd = body_flu_velocity_to_ned(cmd.forward, cmd.left, up, yaw_rad)
+            vn, ve, vd = body_flu_velocity_to_ned(cmd.forward, cmd.left, cmd.up, yaw_rad)
+            if c.teleop_lock_altitude:
+                # Hold the altitude TELEOP started at. Zero vertical speed is not a hold:
+                # every key sags a little, and the keyboard has no way back up.
+                vd = clamp(
+                    c.teleop_k_alt * (self.teleop_d - here.d), -c.teleop_v_z_mps, c.teleop_v_z_mps
+                )
             # dimOS yaw rate is counter-clockwise positive; NED heading rate is clockwise.
             rate_dps = -math.degrees(cmd.yaw_rate_ccw)
             self.yaw_cmd = st.yaw_deg if st.yaw_deg is not None else self.yaw_cmd
@@ -666,7 +790,8 @@ class SupervisorCore:
             self.reason = "teleop"
         else:
             if self.hover is None:
-                self.hover = self._here(st)
+                d = self.teleop_d if c.teleop_lock_altitude else here.d
+                self.hover = HoverPoint(n=here.n, e=here.e, d=d)
                 self.yaw_cmd = st.yaw_deg if st.yaw_deg is not None else self.yaw_cmd
             self.sp = Setpoint(
                 kind="pos", n=self.hover.n, e=self.hover.e, d=self.hover.d, yaw=self.yaw_cmd
@@ -674,8 +799,33 @@ class SupervisorCore:
             self.reason = "teleop idle: holding position"
         if self.guidance_mode != "TELEOP":
             self.teleop = None
-            self.hover = self._here(st)
+            self.hover = here
             self.goto("HOVER", "mode change", now)
+
+    def _step_goto(self, st: VehicleSnapshot, now: float, dt: float) -> None:
+        assert self.goal is not None
+        goal, gc, here = self.goal, self.gcfg.goto, self._here(st)
+        if goal.yaw is not None:
+            self.yaw_cmd = rate_limit_yaw(
+                self.yaw_cmd, goal.yaw, self.gcfg.yaw_track.max_yaw_rate_dps, dt
+            )
+        rng = math.hypot(goal.n - here.n, goal.e - here.e)
+        tol = self.cfg.hover_tolerance_m
+        yaw_now = st.yaw_deg if st.yaw_deg is not None else self.yaw_cmd
+        facing = goal.yaw is None or abs(wrap180(goal.yaw - yaw_now)) <= gc.yaw_tolerance_deg
+        if rng < tol and abs(goal.d - here.d) < tol and facing:
+            # The position setpoint of HOVER closes what is left of the tolerance.
+            self.hover = HoverPoint(n=goal.n, e=goal.e, d=goal.d)
+            if goal.yaw is not None:
+                self.yaw_cmd = goal.yaw
+            self.goto("HOVER", GOTO_ARRIVED, now)
+        elif now - self.state_since > gc.timeout_s:
+            self.hover = here
+            self.goto("HOVER", f"go-to timed out {rng:.1f} m short, holding here", now)
+        else:
+            vn, ve, vd = goto_velocity(here.n, here.e, here.d, goal, gc)
+            self.sp = Setpoint(kind="vel", vn=vn, ve=ve, vd=vd, yaw=self.yaw_cmd, range_m=rng)
+            self.reason = f"go-to: {rng:.1f} m to go"
 
     @staticmethod
     def _here(st: VehicleSnapshot) -> HoverPoint:
@@ -712,6 +862,7 @@ class SupervisorCore:
             enable=self.enable_switch(st),
             sitl=self.sitl,
             setpoint=None if sp is None else _setpoint_dict(sp),
+            goal=dataclasses.asdict(self.goal) if self.state == "GOTO" and self.goal else None,
             local=None if st.local is None else dict(n=st.local.n, e=st.local.e, d=st.local.d),
             batt_pct=st.sys_status.batt_pct if st.sys_status else None,
             gps=None if st.gps is None else dict(fix=st.gps.fix, sats=st.gps.sats, eph=st.gps.eph),
@@ -731,8 +882,10 @@ class SupervisorCore:
             teleop_age_s=None if self.teleop is None else t - self.teleop.t,
         )
         if st.local and self.takeoff:
+            north, east = st.local.n - self.takeoff.n, st.local.e - self.takeoff.e
             out["alt_m"] = self.takeoff.d0 - st.local.d
-            out["dist_m"] = math.hypot(st.local.n - self.takeoff.n, st.local.e - self.takeoff.e)
+            out["dist_m"] = math.hypot(north, east)
+            out["north_m"], out["east_m"] = north, east
         return out
 
 
