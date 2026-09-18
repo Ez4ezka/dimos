@@ -303,6 +303,7 @@ all_modules = {
     "point-lio": "dimos.hardware.sensors.lidar.pointlio.module.PointLio",
     "point-lio-rust": "dimos.hardware.sensors.lidar.pointlio.module.PointLioRust",
     "pointlio-recorder": "dimos.hardware.sensors.lidar.pointlio.recorder.PointlioRecorder",
+    "px4-drone-connection": "dimos.robot.px4.connection.Px4DroneConnection",
     "r1-pro-connection": "dimos.robot.galaxea.r1pro.connection.R1ProConnection",
     "ray-tracing-voxel-map": "dimos.mapping.ray_tracing.module.RayTracingVoxelMap",
     "real-sense-camera": "dimos.hardware.sensors.camera.realsense.camera.RealSenseCamera",
