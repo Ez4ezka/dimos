@@ -59,6 +59,8 @@ from dimos.utils.transform_utils import normalize_angle
 # enters it.
 GUIDANCE_STATES = frozenset({"HOVER", "TELEOP", "GOTO"})
 ARMED_STATES = GUIDANCE_STATES | {"ARMING", "TAKEOFF", "LANDING"}
+# From an accepted takeoff to the hover; any other state after it means it failed.
+TAKEOFF_STATES = frozenset({"PREFLIGHT", "STREAMING", "OFFBOARD_REQ", "ARMING", "TAKEOFF"})
 # The HOVER reason that tells a finished go-to from an interrupted or timed-out one.
 GOTO_ARRIVED = "arrived at the go-to goal"
 GuidanceMode = Literal["HOVER", "TELEOP"]
