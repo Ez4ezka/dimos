@@ -16,16 +16,21 @@
 
 Start ``make px4_sitl gz_x500`` in the PX4 tree, then::
 
-    python dimos/robot/px4/tool_sitl_gate.py          # telemetry, camera
+    python dimos/robot/px4/tool_sitl_gate.py          # telemetry, camera, gimbal
     python dimos/robot/px4/tool_sitl_gate.py --fly    # + the operator flight
 
 Asserts:
 
 - odometry at 25 Hz or better
+- the reader-side stamp lag within 50 ms
 - video frames arriving
+- frames stamped within 50 ms of the vehicle's odometry clock
+- ``tf`` carries the gimbal chain; the gimbal module reports the fake A8's attitude
 - with ``--fly``, the operator flight: a takeoff cancelled by the enable switch before arming,
   takeoff to 2 m, go 2 m south at 3 m, a go-to past the fence refused, a held teleop key
   moving the vehicle at a locked altitude and holding on release, land to IDLE
+
+Detection and target following have their own gate, ``tool_follow_gate.py``.
 """
 
 from __future__ import annotations
@@ -33,22 +38,34 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import statistics
 import threading
 import time
 from typing import Any
 
 from dimos.core.coordination.blueprint_config.parser import BlueprintConfigParser
 from dimos.core.coordination.module_coordinator import ModuleCoordinator
+from dimos.hardware.gimbal.siyi.gimbal import SiyiA8Gimbal
 from dimos.msgs.foxglove_msgs.CompressedVideo import CompressedVideo
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
 from dimos.msgs.nav_msgs.Odometry import Odometry
+from dimos.msgs.tf2_msgs.TFMessage import TFMessage
 from dimos.robot.px4.blueprints import px4_sitl
 from dimos.robot.px4.connection import Px4DroneConnection
+from dimos.robot.px4.sitl import FakeA8
 from dimos.robot.px4.supervisor_core import GOTO_ARRIVED
+from dimos.utils.transform_utils import normalize_angle
 from dimos.visualization.rerun.bridge import RerunBridgeModule
 from dimos.visualization.rerun.websocket_server import RerunWebSocketServer
 
+_STAMP_BOUND_MS = 50.0
+_GIMBAL_TOL_DEG = 3.0
+_CHAIN = {
+    ("base_link", "gimbal_base"),
+    ("gimbal_base", "gimbal_link"),
+    ("gimbal_link", "a8_optical"),
+}
 # The operator flight: how close the simulated vehicle must end up, and the teleop key.
 _POSITION_TOL_M = 0.3
 _SETTLE_S = 4.0
@@ -161,15 +178,24 @@ class _Taps:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.odom_stamps: set[float] = set()  # distinct vehicle samples, not republishes
-        self.frames = 0
+        self.latest_odom_ts = 0.0
+        self.edges: set[tuple[str, str]] = set()
+        self.frame_lag_ms: list[float] = []
 
     def on_odom(self, msg: Odometry) -> None:
         with self.lock:
             self.odom_stamps.add(msg.ts)
+            self.latest_odom_ts = msg.ts
+
+    def on_tf(self, msg: TFMessage) -> None:
+        with self.lock:
+            for t in msg.transforms:
+                self.edges.add((t.frame_id, t.child_frame_id))
 
     def on_video(self, msg: CompressedVideo) -> None:
         with self.lock:
-            self.frames += 1
+            if self.latest_odom_ts:
+                self.frame_lag_ms.append((self.latest_odom_ts - msg.ts) * 1e3)
 
 
 def main() -> int:
@@ -195,9 +221,12 @@ def main() -> int:
     try:
         unsubs = [
             coordinator.transports[("odometry", Odometry)].subscribe(taps.on_odom),
+            coordinator.transports[("tf", TFMessage)].subscribe(taps.on_tf),
             coordinator.transports[("video", CompressedVideo)].subscribe(taps.on_video),
         ]
         drone = coordinator.get_instance(Px4DroneConnection)
+        gimbal = coordinator.get_instance(SiyiA8Gimbal)
+        a8 = coordinator.get_instance(FakeA8)
 
         time.sleep(args.seconds)
         for u in unsubs:
@@ -205,17 +234,37 @@ def main() -> int:
 
         with taps.lock:
             samples = set(taps.odom_stamps)
-            frames = taps.frames
+            edges = set(taps.edges)
+            lags = list(taps.frame_lag_ms)
 
         # 1. Telemetry.
+        stats = drone.sensor_stats()
         hz = len(samples) / args.seconds
         print(f"odometry: {len(samples)} distinct samples in {args.seconds:.0f}s = {hz:.1f} Hz")
-        print(f"tick jitter ms: {drone.sensor_stats()['tick_jitter_ms']}")
+        print(f"timebase: {stats['timebase']}")
+        print(f"tick jitter ms: {stats['tick_jitter_ms']}")
         ok &= hz >= 25.0
+        reader_lag = stats["timebase"]["stamp_lag_ms_p50"]
+        ok &= reader_lag is not None and abs(reader_lag) <= _STAMP_BOUND_MS
 
-        # 2. Camera.
-        print(f"video: {frames} frames in {args.seconds:.0f}s")
-        ok &= frames > 0
+        # 2. Camera and gimbal.
+        print("gimbal chain in tf:", _CHAIN <= edges, sorted(edges))
+        ok &= _CHAIN <= edges
+        if lags:
+            med = statistics.median(lags)
+            print(f"frame stamp vs vehicle clock: median {med:.1f} ms over {len(lags)} frames")
+            ok &= abs(med) <= _STAMP_BOUND_MS
+        else:
+            print("no video frames received")
+            ok = False
+        state = gimbal.state()
+        reported, fake = state["attitude"], a8.attitude()
+        print(f"fake A8: {fake}  gimbal reports: {reported}")
+        ok &= reported is not None
+        if reported is not None:
+            yaw_err = math.degrees(normalize_angle(math.radians(reported["yaw"] - fake["yaw"])))
+            ok &= abs(yaw_err) < _GIMBAL_TOL_DEG
+            ok &= abs(reported["pitch"] - fake["pitch"]) < _GIMBAL_TOL_DEG
 
         # 3. The operator flight.
         if args.fly:
