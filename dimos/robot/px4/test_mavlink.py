@@ -34,17 +34,20 @@ from dimos.robot.px4.mavlink import (
     MavlinkIO,
     VehicleState,
     body_flu_velocity_to_ned,
+    flu_to_ned,
     frd_to_flu,
     ned_to_flu,
     quaternion_from_ned_euler,
 )
 from dimos.robot.px4.supervisor_core import SupervisorCore
+from dimos.robot.px4.timebase import Px4Timebase
 
 
 def test_ned_to_flu_matches_upstream_signs() -> None:
     # Same convention as dimos/robot/drone/test_drone.py::test_ned_to_ros_coordinate_conversion:
     # north -> +x, east -> -y, down -> -z.
     assert ned_to_flu(3.0, 4.0, -1.0) == (3.0, -4.0, 1.0)
+    assert flu_to_ned(*ned_to_flu(3.0, 4.0, -1.0)) == (3.0, 4.0, -1.0)
     assert frd_to_flu(1.0, 2.0, 9.8) == (1.0, -2.0, -9.8)
 
 
@@ -95,10 +98,15 @@ def test_messages_from_other_components_are_ignored() -> None:
 def test_snapshot_ages_use_snapshot_time() -> None:
     st = VehicleState()
     st.handle(Msg("HEARTBEAT", base_mode=0, custom_mode=0), now=100.0)
-    st.handle(Msg("LOCAL_POSITION_NED", x=1, y=2, z=-3, vx=0, vy=0, vz=0), now=100.2)
-    st.handle(Msg("ATTITUDE", roll=0.0, pitch=0.0, yaw=math.radians(90)), now=100.2)
+    st.handle(
+        Msg("LOCAL_POSITION_NED", time_boot_ms=5000, x=1, y=2, z=-3, vx=0, vy=0, vz=0), now=100.2
+    )
+    st.handle(
+        Msg("ATTITUDE", time_boot_ms=5000, roll=0.0, pitch=0.0, yaw=math.radians(90)), now=100.2
+    )
     snap = st.snapshot(now=101.0)
     assert snap.heartbeat_age == 1.0
+    assert snap.local is not None and snap.local.boot_s == 5.0
     assert math.isclose(snap.local_age, 0.8)
     assert snap.yaw_deg == 90.0
     assert snap.rc is None and snap.rc_age == math.inf
@@ -203,7 +211,7 @@ def test_battery_unknowns_are_nan_not_measurements() -> None:
 
 
 def _io() -> MavlinkIO:
-    return MavlinkIO(VehicleState(), url="", source_system=1, source_component=195)
+    return MavlinkIO(VehicleState(), Px4Timebase(), url="", source_system=1, source_component=195)
 
 
 def test_command_ack_resolves_the_future_through_the_hooks(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -268,3 +276,31 @@ def test_the_reader_survives_a_malformed_message() -> None:
     io._reader_loop()
     assert io._state.heartbeat is not None and io._state.heartbeat.main == MAIN_OFFBOARD
     assert io.stats()["bad_data"] == 1
+
+
+# Vehicle clock and gimbal manager.
+
+
+def test_system_time_reaches_the_timebase() -> None:
+    tb = Px4Timebase(min_samples=5)
+    io = MavlinkIO(VehicleState(), tb, url="", source_system=1, source_component=195)
+    for i in range(5):
+        io._ingest(
+            Msg("SYSTEM_TIME", time_unix_usec=(1.8e9 + i) * 1e6, time_boot_ms=(40 + i) * 1e3)
+        )
+    assert io.stats()["timebase"]["quality"] == "system_time"
+    assert tb.offset_s == pytest.approx(1.8e9 - 40.0)
+    io._ingest(Msg("SYSTEM_TIME", src=(1, 154), time_unix_usec=9e15, time_boot_ms=1))  # not PX4's
+    assert tb.samples == 5
+
+
+def test_gimbal_manager_command_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    io = _io()
+    written: list[tuple[int, list[float]]] = []
+    monkeypatch.setattr(io, "_write_command", lambda command, p: written.append((command, p)))
+    io.claim_gimbal_control()
+    io.send_gimbal_pitchyaw(-20.0, 30.0)
+    assert written[0] == (1001, [1.0, 195.0, -1.0, -1.0, 0.0, 0.0, 154.0])
+    command, p = written[1]
+    assert command == 1000 and p[:2] == [-20.0, 30.0] and p[4:] == [0.0, 0.0, 154.0]
+    assert math.isnan(p[2]) and math.isnan(p[3])

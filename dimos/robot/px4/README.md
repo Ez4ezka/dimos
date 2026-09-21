@@ -2,7 +2,7 @@
 
 Fly a PX4 quadcopter from dimOS over MAVLink Offboard.
 
-Status: the SITL gate passes on PX4 v1.16.2. An earlier revision was bench-tested on a
+Status: the SITL gates pass on PX4 v1.16.2. An earlier revision was bench-tested on a
 Pixhawk 6C with props off. Not flown outdoors yet.
 
 ## How it works
@@ -27,12 +27,17 @@ them (see Run).
 | `RtspCamera` | H.265 stream in; passthrough video, decoded frames, small JPEG out | none (video and JPEG rate are RPCs) | video, color_image, color_jpeg | `px4-drone`, `px4-sitl` (generated clip) |
 | `SiyiA8Gimbal` | Gimbal tf chain, camera intrinsics, aim requests | gimbal_attitude, target_los | tf, camera_info, gimbal_target | `px4-drone`, `px4-sitl` |
 | `Px4SkillContainer` | The flight commands as agent skills | none (calls the connection's RPCs) | none | `px4-agentic`, `px4-sitl-agentic` |
+| `Detection2DModule` | Upstream (`dimos/perception/detection`): boxes with track ids | color_image | detections | `px4-follow`, `px4-sitl-follow` |
+| `PerceptionBridge` | Selected detection to line of sight to target position | detections, odometry, gimbal_attitude, global_pose | target_state, target_valid, target_los | `px4-follow`, `px4-sitl-follow` |
+| `Px4DroneConnection` | Its follow ports: the target in, gimbal aim to the A8 over MAVLink, altitude above home out | target_state, target_valid, target_los, gimbal_target | global_pose | all |
+| `FakeA8` | SITL only: answers as the gimbal | gimbal_target | gimbal_attitude | `px4-sitl` |
 
 ## Install
 
 ```bash
 uv sync --extra px4
 uv sync --extra px4 --extra agents        # for px4-agentic
+uv sync --extra px4 --extra perception    # for px4-follow; px4-sitl-follow needs only px4
 ```
 
 ## Run
@@ -44,6 +49,7 @@ uv sync --extra px4 --extra agents        # for px4-agentic
 | `px4-sitl` | the same against PX4 SITL |
 | `px4-teleop`, `px4-sitl-teleop` | those two with the viewer's keyboard on `cmd_vel` |
 | `px4-agentic`, `px4-sitl-agentic` | the teleop pair with the skills, the MCP server and the LLM agent |
+| `px4-follow`, `px4-sitl-follow` | `px4-drone` and `px4-sitl` with `Detection2DModule` and `PerceptionBridge`; the twin detects with `BrightBlobDetector`, no model, no GPU |
 
 ```bash
 dimos run px4-drone
@@ -70,6 +76,8 @@ drone.set_guidance_mode("TELEOP")            # or "HOVER"
 drone.land()
 drone.estop()                                # Hold and latch; estop_clear() works in IDLE
 drone.status()
+app.PerceptionBridge.select_track(1)         # clear_selection() drops it
+drone.set_guidance_mode("FOLLOW")            # or "YAW_TRACK"
 ```
 
 - Every command returns `{"accepted": bool, "rejection": str | None, "state": str}`.
@@ -109,6 +117,30 @@ Skills: `takeoff`, `go_to`, `land`, `set_guidance_mode`, `flight_status`. A skil
 connection RPC plus a wait for the outcome. The supervisor refuses a skill exactly as it
 refuses the RPC.
 
+## Follow
+
+1. `dimos run px4-follow` (or `px4-sitl-follow`), then `drone.takeoff(...)`.
+2. `app.PerceptionBridge.status()["tracks"]` lists the track ids in view. Select one with
+   `select_track(id)`; `clear_selection()` drops it.
+3. `drone.set_guidance_mode("YAW_TRACK")` or `"FOLLOW"`, both selected from `HOVER`.
+
+| Mode | Does | Needs |
+|---|---|---|
+| `YAW_TRACK` | holds position, yaws until the gimbal is within 15 deg of the nose | a line of sight |
+| `FOLLOW` | keeps 12 m standoff at 10 m altitude, 2 m/s or less | a target position |
+
+- Without a fresh target (1 s) both hold position; `FOLLOW` falls back to `HOVER` after 5 s.
+  Gains are in `follow.py` (`YawTrackConfig`, `FollowConfig`).
+- `Detection2DModule` keeps person, bicycle, car, motorcycle, bus, truck, dog.
+  `Detection2DArray` does not carry the class across the transport, so every target is
+  ranged as `default_class="person"`.
+- Detections carry no image size: the `CameraInfo` pinned in `blueprints_follow.py` must
+  match the frames the detector sees (A8 main stream, 1280x720, 1x zoom).
+- Frames are stamped on the host clock, vehicle data with PX4's GPS time: keep the host on
+  UTC (NTP/chrony) or run with `--px4droneconnection.timebase_source=receive_time`. A host
+  clock more than about 0.5 s ahead, or a vehicle clock more than about 2.5 s ahead, reads
+  as a stale attitude; a smaller vehicle-ahead offset goes unseen.
+
 ## Test
 
 ### 1. Unit tests
@@ -119,6 +151,7 @@ No hardware, no simulator.
 uv sync --extra px4
 uv run pytest dimos/robot/px4 dimos/hardware/gimbal/siyi dimos/hardware/sensors/camera/rtsp \
     dimos/msgs/px4_msgs
+uv run pytest dimos/perception/geolocation
 ```
 
 ### 2. SITL gate
@@ -133,16 +166,27 @@ uv run pytest dimos/robot/px4 dimos/hardware/gimbal/siyi dimos/hardware/sensors/
 It runs `px4-sitl` and checks:
 
 - odometry at 25 distinct vehicle samples a second or more
-- video frames arriving
+- video frames stamped within 50 ms of the latest odometry
 - the flight: a takeoff cancelled by the enable switch before arming, takeoff to 2 m, go
   2 m south at 3 m, a go-to past the fence refused, a held key moving the vehicle at a
   locked altitude, land
+- stamps on the vehicle clock, median lag to receipt within 50 ms
+- the gimbal chain in `tf`, the gimbal module reporting the fake A8's attitude
 
 The gate prints its numbers and ends with `GATE PASS` or `GATE FAIL`. Do not run it next to
 another dimOS process: they share one zenoh bus. `ZENOH_SCOUT_ADDR=224.0.0.231:7461` in the
 environment gives a gate its own.
 
-### 3. Fly SITL by hand
+### 3. Other gates
+
+| Gate | Needs | Checks |
+|---|---|---|
+| `tool_follow_gate.py --offline` | nothing | `px4-sitl-follow` from detection to target to gimbal aim; the gate stands in for the vehicle |
+| `tool_follow_gate.py [--fly]` | PX4 SITL | the same against PX4; `--fly` flies `YAW_TRACK`, `FOLLOW`, the lost-target fallback, land |
+
+Run each as `uv run python dimos/robot/px4/<gate>`, one at a time.
+
+### 4. Fly SITL by hand
 
 1. `make px4_sitl gz_x500` in the PX4 checkout.
 2. Open QGroundControl. PX4 will not arm without a ground station.
@@ -181,6 +225,7 @@ environment gives a gate its own.
    | `--rtspcamera.url` | pinned by the blueprint to `A8_RTSP_URL` (`config.py`), the A8's factory address | the camera's URL, if it moved |
    | `--siyia8gimbal.ip` | SIYI SDK off: no zoom poll | the A8's address |
    | `--siyia8gimbal.mount_xyz` | pinned by the blueprint to `GIMBAL_MOUNT_XYZ_UNMEASURED` (`config.py`), a placeholder; nothing warns | `[x,y,z]` measured from `base_link` to the gimbal base, metres, FLU |
+   | `--siyia8gimbal.aim_enabled`, `--px4droneconnection.gimbal_commands_enabled` | `gimbal_target` is counted and dropped; whatever else controls the A8 keeps it | `true` on both: dimOS pitches the gimbal to the target's elevation and keeps its present yaw |
 
 6. Sync the companion computer's clock (NTP/chrony) before takeoff: staleness checks and
    the setpoint stream run on it.
@@ -200,3 +245,4 @@ start while another process holds it.
 4. Takeoff altitudes and go-to goals are checked against the fence, the ceiling and
    `min_alt_m` before anything moves. `GOTO` obeys the same abort rules as every armed
    state.
+5. Gimbal aim commands go out only when `gimbal_commands_enabled` is set on the connection.

@@ -19,9 +19,9 @@
 ``px4-drone``
     Everything on the aircraft: the connection, the A8 camera and gimbal.
 ``px4-sitl``
-    The same modules against PX4 SITL (``make px4_sitl gz_x500``). The camera replays a
-    generated clip; the simulator has no A8, so the gimbal module gets no attitude and
-    publishes no tf. ``tool_sitl_gate.py`` runs this blueprint end to end.
+    The same modules against PX4 SITL (``make px4_sitl gz_x500``). What the simulator lacks
+    is stood in for: the camera replays a generated clip, FakeA8 answers as the gimbal.
+    ``tool_sitl_gate.py`` runs this blueprint end to end.
 ``px4-teleop``, ``px4-sitl-teleop``
     The aircraft and its twin with the viewer's keyboard on ``cmd_vel``, the way
     ``r1pro-teleop`` wires it.
@@ -33,6 +33,8 @@ key for a port no module in the blueprint has is simply unused.
 from __future__ import annotations
 
 from typing import Any
+
+from dimos_lcm.std_msgs import Bool  # type: ignore[import-untyped]
 
 from dimos.core.coordination.blueprints import Blueprint, TransportSpec, autoconnect
 from dimos.core.global_config import global_config
@@ -53,9 +55,11 @@ from dimos.msgs.sensor_msgs.JointState import JointState
 from dimos.msgs.sensor_msgs.NavSatFix import NavSatFix
 from dimos.msgs.std_msgs.String import String
 from dimos.msgs.tf2_msgs.TFMessage import TFMessage
+from dimos.msgs.vision_msgs.Detection2DArray import Detection2DArray
 from dimos.protocol.pubsub.impl.zenohpubsub import QOS_LATEST_WINS, Topic as ZenohTopic, Zenoh
 from dimos.robot.px4.config import A8_RTSP_URL, GIMBAL_MOUNT_XYZ_UNMEASURED, SITL_MAV_URL
 from dimos.robot.px4.connection import Px4DroneConnection
+from dimos.robot.px4.sitl import FakeA8
 from dimos.visualization.rerun.bridge import RerunBridgeModule
 from dimos.visualization.rerun.websocket_server import RerunWebSocketServer
 
@@ -79,6 +83,10 @@ def px4_transports() -> dict[tuple[str, type], TransportSpec | Transport[Any]]:
     return {
         # Into the connection. cmd_vel is the public Twist bus any teleop module drives.
         ("cmd_vel", Twist): _zenoh_transport("cmd_vel", Twist),
+        ("gimbal_target", JointState): _zenoh_transport("gimbal_target", JointState),
+        ("target_state", Odometry): _zenoh_transport("target_state", Odometry),
+        ("target_valid", Bool): _zenoh_transport("target_valid", Bool),
+        ("target_los", PoseStamped): _zenoh_transport("target_los", PoseStamped),
         # Out of the connection: the vehicle.
         ("odometry", Odometry): _zenoh_transport("odometry", Odometry, latest_wins=True),
         ("odom", PoseStamped): _zenoh_transport("odom", PoseStamped, latest_wins=True),
@@ -89,6 +97,7 @@ def px4_transports() -> dict[tuple[str, type], TransportSpec | Transport[Any]]:
         ("gimbal_attitude", JointState): _zenoh_transport(
             "gimbal_attitude", JointState, latest_wins=True
         ),
+        ("global_pose", PoseStamped): _zenoh_transport("global_pose", PoseStamped),
         ("vehicle_status", VehicleStatus): _zenoh_transport("vehicle_status", VehicleStatus),
         ("statustext", String): _zenoh_transport("statustext", String),
         # Out of the connection: the supervisor.
@@ -99,6 +108,10 @@ def px4_transports() -> dict[tuple[str, type], TransportSpec | Transport[Any]]:
             "color_jpeg", CompressedImage, latest_wins=True
         ),
         ("camera_info", CameraInfo): _zenoh_transport("camera_info", CameraInfo),
+        # Perception.
+        ("detections", Detection2DArray): _zenoh_transport(
+            "detections", Detection2DArray, latest_wins=True
+        ),
     }
 
 
@@ -191,7 +204,8 @@ px4_basic = (
     .global_config(transport="zenoh", n_workers=2)
 )
 
-# The gimbal module owns the gimbal tf chain.
+# The gimbal module owns the gimbal tf chain. Aim requests stay off until the connection is
+# configured to own the A8 (``gimbal_commands_enabled``); whatever else controls it keeps it.
 px4_drone = (
     autoconnect(
         px4_visualization(),
@@ -203,8 +217,9 @@ px4_drone = (
     .global_config(transport="zenoh", n_workers=2)
 )
 
-# The camera keeps the aircraft's frame and latency pins so the twin stamps frames the same
-# way.
+# The fake A8 starts 20 deg down and 30 deg right so the synthetic target (parked at the
+# image centre) has a non-trivial line of sight. The camera keeps the aircraft's frame and
+# latency pins so the twin stamps frames the same way.
 px4_sitl = (
     autoconnect(
         px4_visualization(),
@@ -213,8 +228,10 @@ px4_sitl = (
             url=SYNTHETIC_URL,
             frame_id="a8_optical",
             capture_latency_s=0.08,
+            color_hz=25.0,  # the clip's frame rate, for the detector of px4-sitl-follow
         ),
-        SiyiA8Gimbal.blueprint(mount_xyz=GIMBAL_MOUNT_XYZ_UNMEASURED),
+        SiyiA8Gimbal.blueprint(mount_xyz=GIMBAL_MOUNT_XYZ_UNMEASURED, aim_enabled=True),
+        FakeA8.blueprint(initial_pitch_deg=-20.0, initial_yaw_deg=30.0),
     )
     .transports(px4_transports())
     .global_config(transport="zenoh", n_workers=2)

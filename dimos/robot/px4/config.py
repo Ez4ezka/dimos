@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from dimos.robot.px4.follow import FollowConfig, YawTrackConfig
+
 # MAVLink identities on the vehicle bus. PX4 is 1/1; the SIYI A8 answers as 1/154 through
 # PX4's second MAVLink instance.
 PX4_SYSID = 1
@@ -60,6 +62,8 @@ class GotoConfig:
 @dataclass(frozen=True)
 class GuidanceConfig:
     goto: GotoConfig = field(default_factory=GotoConfig)
+    yaw_track: YawTrackConfig = field(default_factory=YawTrackConfig)
+    follow: FollowConfig = field(default_factory=FollowConfig)
 
 
 @dataclass(frozen=True)
@@ -83,6 +87,7 @@ class SupervisorLimits:
     enable_threshold_us: int = 1500
     rc_stale_s: float = 1.0
     px4_stale_s: float = 1.0
+    target_stale_s: float = 1.0
     setpoint_hz: float = 20.0
     prestream_s: float = 1.5
     hover_tolerance_m: float = 0.5
