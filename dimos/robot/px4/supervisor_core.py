@@ -17,7 +17,7 @@
 States::
 
   IDLE -> PREFLIGHT -> STREAMING -> OFFBOARD_REQ -> ARMING -> TAKEOFF -> HOVER
-  HOVER <-> TELEOP                            (operator selects the guidance mode)
+  HOVER <-> YAW_TRACK / FOLLOW / TELEOP       (operator selects the guidance mode)
   any guidance state -> GOTO -> HOVER         (operator go-to; ends hovering at the goal)
   any armed state -> LANDING -> IDLE          (operator land)
   any armed state -> ABORT -> IDLE            (safety rule: PX4 put in Hold, setpoints stop)
@@ -43,6 +43,7 @@ from typing import Any, Literal, Protocol
 import numpy as np
 
 from dimos.robot.px4.config import GotoConfig, GuidanceConfig, SupervisorLimits
+from dimos.robot.px4.follow import FollowGuidance
 from dimos.robot.px4.mavlink import (
     LANDED_ON_GROUND,
     MAIN_AUTO,
@@ -57,14 +58,14 @@ from dimos.utils.transform_utils import normalize_angle
 
 # GOTO is a guidance state but not a selectable mode: it needs a goal, so only goto_cmd
 # enters it.
-GUIDANCE_STATES = frozenset({"HOVER", "TELEOP", "GOTO"})
+GUIDANCE_STATES = frozenset({"HOVER", "YAW_TRACK", "FOLLOW", "TELEOP", "GOTO"})
 ARMED_STATES = GUIDANCE_STATES | {"ARMING", "TAKEOFF", "LANDING"}
 # From an accepted takeoff to the hover; any other state after it means it failed.
 TAKEOFF_STATES = frozenset({"PREFLIGHT", "STREAMING", "OFFBOARD_REQ", "ARMING", "TAKEOFF"})
 # The HOVER reason that tells a finished go-to from an interrupted or timed-out one.
 GOTO_ARRIVED = "arrived at the go-to goal"
-GuidanceMode = Literal["HOVER", "TELEOP"]
-GUIDANCE_MODES: tuple[GuidanceMode, ...] = ("HOVER", "TELEOP")
+GuidanceMode = Literal["HOVER", "YAW_TRACK", "FOLLOW", "TELEOP"]
+GUIDANCE_MODES: tuple[GuidanceMode, ...] = ("HOVER", "YAW_TRACK", "FOLLOW", "TELEOP")
 
 _ABORT_DWELL_S = 2.0
 _PREFLIGHT_TIMEOUT_S = 10.0
@@ -211,6 +212,7 @@ class SupervisorCore:
         self.reason = "startup"
         self.guidance_mode: GuidanceMode = "HOVER"
         self.fake_enable = False
+        self.follow = FollowGuidance(guidance.yaw_track, guidance.follow, limits.target_stale_s)
         self.sp: Setpoint | None = None
         self.yaw_cmd: float = 0.0
         self.takeoff: TakeoffPoint | None = None
@@ -612,6 +614,8 @@ class SupervisorCore:
             )
             if self.guidance_mode != "HOVER" and now - self.state_since > self.cfg.hover_settle_s:
                 self.goto(self.guidance_mode, "settled", now)
+        elif s in ("YAW_TRACK", "FOLLOW"):
+            self.follow.step(self, st, now, dt)
         elif s == "TELEOP":
             self._step_teleop(st, now)
         elif s == "GOTO":
@@ -722,6 +726,7 @@ class SupervisorCore:
             local=None if st.local is None else dict(n=st.local.n, e=st.local.e, d=st.local.d),
             batt_pct=st.sys_status.batt_pct if st.sys_status else None,
             gps=None if st.gps is None else dict(fix=st.gps.fix, sats=st.gps.sats, eph=st.gps.eph),
+            **self.follow.status(t),
             position_valid=None if st.estimator is None else st.estimator.position_valid,
             estop_latched=self.estop_latched,
             last_rejection=None if self.last_rejection is None else self.last_rejection.value,

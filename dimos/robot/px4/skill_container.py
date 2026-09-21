@@ -168,7 +168,7 @@ class Px4SkillContainer(Module):
 
         Args:
             mode: HOVER holds position (also stops a go-to), TELEOP hands the drone to
-                the operator's keyboard.
+                the operator's keyboard, YAW_TRACK and FOLLOW track the selected target.
         """
         result = self._connection.set_guidance_mode(mode)
         if not result["accepted"]:

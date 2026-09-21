@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable
+from dataclasses import replace
 import math
 import socket
 import threading
@@ -42,6 +43,7 @@ from typing import Any, Literal
 from dimos_lcm.sensor_msgs.BatteryState import BatteryState as LCMBatteryState
 from dimos_lcm.sensor_msgs.NavSatFix import NavSatFix as LCMNavSatFix
 from dimos_lcm.sensor_msgs.NavSatStatus import NavSatStatus
+from dimos_lcm.std_msgs import Bool  # type: ignore[import-untyped]
 import numpy as np
 from pydantic import Field
 from reactivex.disposable import Disposable
@@ -50,7 +52,13 @@ from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In, Out
-from dimos.hardware.gimbal.siyi.frame import MOUNT_PRESETS
+from dimos.hardware.gimbal.siyi.frame import (
+    MOUNT_PRESETS,
+    PITCH_MAX_DEG,
+    PITCH_MIN_DEG,
+    YAW_MAX_DEG,
+    YAW_MIN_DEG,
+)
 from dimos.msgs.geometry_msgs.Pose import Pose
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Quaternion import Quaternion
@@ -66,6 +74,7 @@ from dimos.msgs.sensor_msgs.NavSatFix import NavSatFix
 from dimos.msgs.std_msgs.String import String
 from dimos.msgs.tf2_msgs.TFMessage import TFMessage
 from dimos.robot.px4.config import (
+    A8_COMPID,
     DIMOS_COMPID,
     PX4_SYSID,
     ROUTER_MAV_URL,
@@ -73,12 +82,14 @@ from dimos.robot.px4.config import (
     GuidanceConfig,
     SupervisorLimits,
 )
+from dimos.robot.px4.follow import TargetEstimate
 from dimos.robot.px4.mavlink import (
     MAIN_AUTO,
     SUB_AUTO_LOITER,
     MavlinkIO,
     VehicleSnapshot,
     VehicleState,
+    flu_to_ned,
     frd_to_flu,
     mode_name,
     ned_to_flu,
@@ -92,6 +103,7 @@ from dimos.robot.px4.supervisor_core import (
     SupervisorCore,
     TeleopCommand,
 )
+from dimos.robot.px4.timebase import Px4Timebase, request_system_time
 from dimos.utils.logging_config import setup_logger
 
 logger = setup_logger()
@@ -102,6 +114,7 @@ _PUBLISH_BASE_HZ = 100.0
 _JITTER_WINDOW = 2000
 _GIMBAL_MAX_AGE_S = 1.0
 _GIMBAL_JOINTS = ["gimbal_roll", "gimbal_pitch", "gimbal_yaw"]
+_GIMBAL_TARGET_JOINTS = ("gimbal_pitch", "gimbal_yaw")
 
 
 class Px4DroneConnectionConfig(ModuleConfig):
@@ -125,6 +138,22 @@ class Px4DroneConnectionConfig(ModuleConfig):
     battery_hz: float = Field(default=1.0)
     gimbal_hz: float = Field(default=10.0)
     statustext_hz: float = Field(default=10.0)
+    # "system_time" converts vehicle boot time to UTC from SYSTEM_TIME (GPS-disciplined);
+    # "receive_time" stamps with the companion computer's wall clock at receipt.
+    timebase_source: Literal["system_time", "receive_time"] = Field(default="system_time")
+    # SYSTEM_TIME samples wanted before the tick loop starts, and how long to wait for them
+    # (a timeout of 0 starts without waiting).
+    timebase_samples: int = Field(default=30, ge=1)
+    timebase_timeout_s: float = Field(default=10.0)
+    # PX4 streams SYSTEM_TIME at 1 Hz by default; ask for this rate so the samples arrive
+    # in seconds, not half a minute (0 = leave the vehicle setting alone).
+    system_time_hz: float = Field(default=10.0)
+    # Off: gimbal_target is counted and dropped and whatever else controls the A8 keeps
+    # it. On: this module claims primary gimbal control at start.
+    # Aim commands go at most gimbal_command_hz; the A8 reports attitude at 10 Hz.
+    gimbal_commands_enabled: bool = Field(default=False)
+    gimbal_component: int = Field(default=A8_COMPID)
+    gimbal_command_hz: float = Field(default=10.0)
     # SITL: the RC enable switch is faked by the sitl_enable RPC and RC checks are skipped.
     sitl: bool = Field(default=False)
     sensor_stats_interval_s: float = Field(default=10.0)
@@ -166,6 +195,12 @@ class Px4DroneConnection(Module):
 
     # Control inputs.
     cmd_vel: In[Twist]
+    gimbal_target: In[JointState]
+
+    # Perception inputs (PerceptionBridge).
+    target_state: In[Odometry]
+    target_valid: In[Bool]
+    target_los: In[PoseStamped]
 
     # Vehicle feedback. The odometry twist is linear in odom (world FLU), like PX4's
     # vehicle_odometry, and angular in base_link.
@@ -178,6 +213,7 @@ class Px4DroneConnection(Module):
     gimbal_attitude: Out[JointState]
     vehicle_status: Out[VehicleStatus]
     statustext: Out[String]
+    global_pose: Out[PoseStamped]
 
     # Supervisor streams.
     supervisor_state: Out[String]
@@ -198,6 +234,15 @@ class Px4DroneConnection(Module):
         self._last_statustext_seq = 0
         self._cmd_vel_rejections: dict[str, int] = {}
         self._cmd_vel_accepted = 0
+        self._timebase = Px4Timebase(min_samples=self.config.timebase_samples)
+        self._target_valid = False
+        self._target_state: tuple[float, float, float, float] | None = None  # n, e, vn, ve
+        self._target_state_t = 0.0
+        self._target_los_yaw_body_deg: float | None = None
+        self._target_los_t = 0.0
+        self._gimbal_target_dropped = 0
+        self._gimbal_target_sent = 0
+        self._gimbal_last_send = 0.0
 
     # Lifecycle
 
@@ -210,6 +255,7 @@ class Px4DroneConnection(Module):
         self._core = SupervisorCore(cfg.limits, cfg.guidance, sitl=cfg.sitl)
         self._io = MavlinkIO(
             self._state,
+            self._timebase,
             url=cfg.mav_url,
             source_system=PX4_SYSID,
             source_component=cfg.source_component,
@@ -221,8 +267,17 @@ class Px4DroneConnection(Module):
             self._release()  # or the reader and both sockets outlive the failed start
             raise
         self._io.send_heartbeat()
+        if cfg.timebase_source == "system_time":
+            self._collect_timebase()
+        if cfg.gimbal_commands_enabled:
+            self._io.claim_gimbal_control(cfg.gimbal_component)
+            logger.warning("requested primary gimbal control", component=cfg.source_component)
 
         self.register_disposable(Disposable(self.cmd_vel.subscribe(self._on_cmd_vel)))
+        self.register_disposable(Disposable(self.gimbal_target.subscribe(self._on_gimbal_target)))
+        self.register_disposable(Disposable(self.target_state.subscribe(self._on_target_state)))
+        self.register_disposable(Disposable(self.target_valid.subscribe(self._on_target_valid)))
+        self.register_disposable(Disposable(self.target_los.subscribe(self._on_target_los)))
 
         self._stop_event.clear()
         self._threads = [
@@ -239,6 +294,7 @@ class Px4DroneConnection(Module):
         logger.info(
             "Px4DroneConnection started",
             writer=self._io.writer_id,
+            timebase=self._timebase.quality,
             sitl=cfg.sitl,
         )
 
@@ -274,6 +330,21 @@ class Px4DroneConnection(Module):
             ) from e
         self._writer_lock_sock = sock
 
+    def _collect_timebase(self) -> None:
+        cfg = self.config
+        assert self._io is not None
+        if cfg.system_time_hz > 0:
+            request_system_time(self._io, cfg.system_time_hz, cfg.limits.ack_timeout_s)
+        deadline = time.monotonic() + cfg.timebase_timeout_s
+        while time.monotonic() < deadline and self._timebase.samples < cfg.timebase_samples:
+            time.sleep(0.05)
+        if self._timebase.quality != "system_time":
+            logger.warning(
+                "timebase below target quality",
+                quality=self._timebase.quality,
+                samples=self._timebase.samples,
+            )
+
     # Input handlers
 
     def _on_cmd_vel(self, msg: Twist) -> None:
@@ -294,6 +365,88 @@ class Px4DroneConnection(Module):
             self._cmd_vel_accepted += 1
         else:
             self._cmd_vel_rejections[why.value] = self._cmd_vel_rejections.get(why.value, 0) + 1
+
+    def _on_gimbal_target(self, msg: JointState) -> None:
+        io = self._io
+        cfg = self.config
+        if io is None or not cfg.gimbal_commands_enabled:
+            self._gimbal_target_dropped += 1
+            return
+        now = time.monotonic()
+        if now - self._gimbal_last_send < 1.0 / cfg.gimbal_command_hz:
+            return
+        angles = dict(zip(msg.name, msg.position, strict=False))
+        try:
+            pitch = math.degrees(angles["gimbal_pitch"])
+            yaw = math.degrees(angles["gimbal_yaw"])
+        except KeyError:
+            logger.warning(
+                "gimbal_target needs joints", expected=_GIMBAL_TARGET_JOINTS, got=msg.name
+            )
+            self._gimbal_target_dropped += 1
+            return
+        if not (math.isfinite(pitch) and math.isfinite(yaw)):  # np.clip passes NaN through
+            self._gimbal_target_dropped += 1
+            return
+        io.send_gimbal_pitchyaw(
+            float(np.clip(pitch, PITCH_MIN_DEG, PITCH_MAX_DEG)),
+            float(np.clip(yaw, YAW_MIN_DEG, YAW_MAX_DEG)),
+            cfg.gimbal_component,
+        )
+        self._gimbal_last_send = now
+        self._gimbal_target_sent += 1
+
+    def _on_target_valid(self, msg: Bool) -> None:
+        self._target_valid = bool(msg.data)
+
+    def _on_target_los(self, msg: PoseStamped) -> None:
+        # Line of sight in base_link (FLU, counter-clockwise positive); the gimbal yaw
+        # convention is body-relative clockwise positive.
+        try:
+            yaw = -math.degrees(msg.yaw)
+        except ValueError:  # zero or NaN quaternion
+            return
+        if not math.isfinite(yaw):  # it would reach the yaw setpoint
+            return
+        now = time.time()
+        with self._core_lock:
+            self._target_los_yaw_body_deg, self._target_los_t = yaw, now
+            self._push_target(now)
+
+    def _on_target_state(self, msg: Odometry) -> None:
+        n, e, _ = flu_to_ned(msg.x, msg.y, msg.z)
+        vn, ve, _ = flu_to_ned(msg.vx, msg.vy, 0.0)
+        if not all(map(math.isfinite, (n, e, vn, ve))):  # it would reach the velocity setpoint
+            return
+        now = time.time()
+        with self._core_lock:
+            self._target_state, self._target_state_t = (n, e, vn, ve), now
+            self._push_target(now)
+
+    def _push_target(self, now: float) -> None:
+        """The supervisor's target from whichever of position and line of sight is fresh.
+
+        A line of sight too shallow for a ground position still yaws the vehicle (YAW_TRACK).
+        Called under ``_core_lock``: the two streams arrive on their own threads.
+        """
+        core = self._core
+        if core is None:
+            return
+        stale_s = self.config.limits.target_stale_s
+        state = self._target_state if now - self._target_state_t <= stale_s else None
+        los_fresh = now - self._target_los_t <= stale_s
+        n, e, vn, ve = state or (None, None, 0.0, 0.0)
+        target = TargetEstimate(
+            valid=self._target_valid and state is not None,
+            n=n,
+            e=e,
+            vn=vn,
+            ve=ve,
+            los_valid=los_fresh,
+            gimbal_yaw_body_deg=self._target_los_yaw_body_deg if los_fresh else None,
+        )
+        # A re-sent position keeps its own age, or FOLLOW would fly on it for 2 x stale_s.
+        core.follow.on_target(target, now, position_t=self._target_state_t)
 
     # Threads
 
@@ -402,13 +555,25 @@ class Px4DroneConnection(Module):
 
     # Publishers (publish thread)
 
+    def _stamp(self, boot_s: float | None, rx_t: float) -> float:
+        if boot_s is None or self.config.timebase_source != "system_time":
+            return rx_t
+        if self._timebase.quality == "none":
+            return rx_t
+        return self._timebase.to_utc(boot_s)
+
     def _publish_odometry(self, state: VehicleState) -> None:
         with state.lock:
             local, att, imu = state.local, state.attitude, state.imu
+            if local is not None and att is not None:
+                # The attitude at the position sample's own instant, not the latest one.
+                hist = state.attitude_history
+                at = hist.at_boot(local.boot_s) if local.boot_s is not None else None
+                att = replace(att, **(at or hist.at(local.t) or {}))
         if local is None or att is None:
             return
         cfg = self.config
-        ts = local.t
+        ts = self._stamp(local.boot_s, local.t)
         x, y, z = ned_to_flu(local.n, local.e, local.d)
         vx, vy, vz = ned_to_flu(local.vn, local.ve, local.vd)
         q = quaternion_from_ned_euler(
@@ -448,13 +613,14 @@ class Px4DroneConnection(Module):
                 linear_acceleration=Vector3(*frd_to_flu(imu.xacc, imu.yacc, imu.zacc)),
                 orientation=orientation,
                 frame_id=self.config.base_frame_id,
-                ts=imu.t,
+                ts=self._stamp(imu.boot_s, imu.t),
             )
         )
 
     def _publish_gps(self, state: VehicleState) -> None:
         with state.lock:
             gps, gp = state.gps, state.global_pos
+        self._publish_global_pose(state)
         # Without GLOBAL_POSITION_INT there is no position: a fix at 0, 0 would look valid.
         if gps is None or gp is None:
             return
@@ -474,6 +640,20 @@ class Px4DroneConnection(Module):
                 ),
                 frame_id="gps",
                 ts=gps.t,
+            )
+        )
+
+    def _publish_global_pose(self, state: VehicleState) -> None:
+        """Only z is filled: the altitude above home, which is all anyone reads."""
+        with state.lock:
+            gp = state.global_pos
+        if gp is None:
+            return
+        self.global_pose.publish(
+            PoseStamped(
+                ts=self._stamp(gp.boot_s, gp.t),
+                frame_id="home",
+                position=Vector3(0.0, 0.0, gp.rel_alt),
             )
         )
 
@@ -551,6 +731,10 @@ class Px4DroneConnection(Module):
                 home_lat=home.lat if home else 0.0,
                 home_lon=home.lon if home else 0.0,
                 home_alt=home.alt if home else 0.0,
+                timebase_quality=self._timebase.quality,
+                timebase_offset_s=(
+                    self._timebase.offset_s if self._timebase.quality != "none" else 0.0
+                ),
                 writer=writer,
                 state=core_state,
                 estop_latched=estop,
@@ -633,7 +817,7 @@ class Px4DroneConnection(Module):
 
     @rpc
     def set_guidance_mode(self, mode: str) -> dict[str, Any]:
-        """Select HOVER or TELEOP.
+        """Select HOVER, YAW_TRACK, FOLLOW or TELEOP.
 
         Immediate while flying, otherwise entered ``hover_settle_s`` after the hover is reached.
         """
@@ -677,12 +861,16 @@ class Px4DroneConnection(Module):
 
     @rpc
     def sensor_stats(self) -> dict[str, Any]:
-        """Per-message counters and ages, ack results, cmd_vel verdicts."""
+        """Per-message counters and ages, ack results, timebase quality, cmd_vel verdicts."""
         io = self._io
         out: dict[str, Any] = {} if io is None else io.stats()
         out["cmd_vel"] = {
             "accepted": self._cmd_vel_accepted,
             "rejected": dict(self._cmd_vel_rejections),
+        }
+        out["gimbal_target"] = {
+            "sent": self._gimbal_target_sent,
+            "dropped": self._gimbal_target_dropped,
         }
         out["tick_jitter_ms"] = _percentiles(list(self._jitter_ms))
         return out
