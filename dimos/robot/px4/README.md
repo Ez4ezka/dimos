@@ -26,11 +26,13 @@ them (see Run).
 | `Px4DroneConnection` | MAVLink bridge, flight supervisor | cmd_vel | odometry (twist: linear in `odom`, angular in `base_link`), odom, tf, imu, gps, battery, gimbal_attitude, vehicle_status, statustext, supervisor_state | all |
 | `RtspCamera` | H.265 stream in; passthrough video, decoded frames, small JPEG out | none (video and JPEG rate are RPCs) | video, color_image, color_jpeg | `px4-drone`, `px4-sitl` (generated clip) |
 | `SiyiA8Gimbal` | Gimbal tf chain, camera intrinsics, aim requests | gimbal_attitude, target_los | tf, camera_info, gimbal_target | `px4-drone`, `px4-sitl` |
+| `Px4SkillContainer` | The flight commands as agent skills | none (calls the connection's RPCs) | none | `px4-agentic`, `px4-sitl-agentic` |
 
 ## Install
 
 ```bash
 uv sync --extra px4
+uv sync --extra px4 --extra agents        # for px4-agentic
 ```
 
 ## Run
@@ -41,6 +43,7 @@ uv sync --extra px4
 | `px4-drone` | the aircraft: connection, viewer and every module listed for it above |
 | `px4-sitl` | the same against PX4 SITL |
 | `px4-teleop`, `px4-sitl-teleop` | those two with the viewer's keyboard on `cmd_vel` |
+| `px4-agentic`, `px4-sitl-agentic` | the teleop pair with the skills, the MCP server and the LLM agent |
 
 ```bash
 dimos run px4-drone
@@ -88,6 +91,23 @@ drone.status()
 Keys are ignored outside `TELEOP`. Speeds are clamped to 1.5 m/s (W+Q together too) and
 0.8 rad/s. Altitude
 stays where `TELEOP` began. When keys stop for 0.5 s the vehicle holds position.
+
+## Agent
+
+1. `uv sync --extra px4 --extra agents` and set `OPENAI_API_KEY`.
+2. `dimos run px4-agentic` (or `px4-sitl-agentic`). SITL: open QGroundControl and run
+   `drone.sitl_enable(True)` in `dimos shell` first (see Fly SITL by hand).
+3. Send commands:
+
+```bash
+dimos agent-send "take off to 2 meters"
+dimos agent-send "go to 2 meters south at 3 m altitude"
+dimos mcp call go_to --arg north_m=-2 --arg altitude_m=3 --timeout 120   # the same skill, no LLM; it blocks until the manoeuvre ends
+```
+
+Skills: `takeoff`, `go_to`, `land`, `set_guidance_mode`, `flight_status`. A skill is the
+connection RPC plus a wait for the outcome. The supervisor refuses a skill exactly as it
+refuses the RPC.
 
 ## Test
 
